@@ -104,6 +104,7 @@ const dolly = new THREE.Group();   // XR空間ではこのグループを動か�
 dolly.add(camera);
 scene.add(dolly);
 camera.position.set(0, 1.6, 0);
+dolly.position.set(pathX(0), heightAt(pathX(0), 0), 0);  // 道の上からスタート
 
 scene.add(new THREE.HemisphereLight(0xe8d8ff, 0x6b5a4a, 1.0));
 const sun = new THREE.DirectionalLight(0xffd9a8, 1.6);
