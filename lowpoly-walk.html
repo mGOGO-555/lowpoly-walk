@@ -55,9 +55,10 @@
     <div class="row"><span>課題</span><span id="taskBtns"></span></div>
     <div class="row"><button id="cueBtn"></button><button id="bpmDn">−</button><span id="bpmVal"></span><button id="bpmUp">＋</button></div>
     <div class="row"><button id="legBtn"></button><button id="hudBtn"></button><button id="goalBtn"></button></div>
-    <div class="row"><button id="recBtn"></button><button id="csvBtn">CSV保存</button></div>
+    <div class="row"><button id="recBtn"></button><button id="csvBtn">CSV保存</button><button id="autoBtn"></button></div>
     <small>PC: <kbd>W</kbd>で歩くと歩数を擬似カウント / <kbd>R</kbd> 記録 / ストループ <kbd>Z</kbd>赤 <kbd>X</kbd>青 <kbd>C</kbd>緑 <kbd>V</kbd>黄 / Go/NoGo <kbd>Space</kbd><br>
-    VR: 右A=青 右B=赤 左X=緑 左Y=黄 / トリガー=Go / 左スティック上下=レベル / 右スティック上下=歩調 / 右スティック押込=記録 / 左スティック押込=HUD</small>
+    VR(コントローラー): 右A=青 右B=赤 左X=緑 左Y=黄 / トリガー=Go / 左スティック上下=レベル / 右スティック上下=歩調 / 右スティック押込=記録 / 左スティック押込=HUD<br>
+    VR(手の追跡): 親指と つまむ 人差し指=赤 中指=青 薬指=緑 小指=黄 / Go=人差し指</small>
   </div>
   <div id="status"></div>
 </div>
@@ -75,6 +76,7 @@
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 
 /* ========== 調整用パラメータ ========== */
 const STEP_THRESHOLD = 0.12;  // 足踏み判定のしきい値 (頭の上下速度 m/s)。小さいほど敏感
@@ -1182,10 +1184,18 @@ function summarize() {
 function stopRec() {
   if (!rec.on) return;
   logRow('event', { note: 'record stop' });
-  rec.tEnd = nowS(); rec.summary = summarize(); rec.on = false;
+  rec.tEnd = nowS(); rec.summary = summarize(); rec.on = false; saveLast();
   toast(`記録終了 歩数${M.steps} ${M.dist.toFixed(0)}m`, 6); syncUI();
 }
 const toggleRec = () => (rec.on ? stopRec() : startRec());
+function saveLast() {                 // 直近の記録をブラウザに保存 (再読み込みしても「CSV保存」できる)
+  try { localStorage.setItem('lw_last', JSON.stringify({ start: rec.start, rows: rec.rows, summary: rec.summary })); } catch (e) { /* 保存できない環境では何もしない */ }
+}
+try {
+  const d = JSON.parse(localStorage.getItem('lw_last') || 'null');
+  if (d && d.rows && d.rows.length) { rec.rows = d.rows; rec.summary = d.summary; rec.start = d.start; }
+} catch (e) { /* 読み込めなければ無視 */ }
+let lastSave = 0;
 function buildCSV() {
   const s = rec.summary || (rec.rows.length ? summarize() : null);
   const head = ['# lowpoly-walk record', `# start,${rec.start}`, `# seed,${seed}`, `# events_on,${eventsOn}`, `# npc_on,${npcOn}`, `# cue_bpm,${cueOn ? bpm : 'off'}`, `# legs,${legsOn}`, `# legL,${legGain[0]}`, `# legR,${legGain[1]}`, `# legDelay_ms,${legDelay * 1000}`];
@@ -1216,6 +1226,7 @@ function recordSample(dt, speed, now) {
   sampleT += dt;
   if (sampleT < 0.5) return;
   sampleT = 0;
+  if (rec.on && now - lastSave > 30) { lastSave = now; saveLast(); }
   const cv = stepCV();
   logRow('sample', { speed: speed.toFixed(2), cad: cadence(now).toFixed(1), cv: cv === null ? '' : cv.toFixed(1) });
 }
@@ -1272,10 +1283,12 @@ function drawStim(now) {
       panel(0.55);
       if (task === 'stroop') {
         g.font = `bold 150px ${FONT}`; g.fillStyle = INK[tk.stim.ink].c; g.fillText(INK[tk.stim.word].n, 256, 108);
-        g.font = `26px ${FONT}`; g.fillStyle = '#cccccc'; g.fillText('文字の色  B赤  A青  X緑  Y黄', 256, 224);
+        g.font = `24px ${FONT}`; g.fillStyle = '#cccccc';
+        if (handMode) { g.fillText('文字の色を、親指とつまんで答える', 256, 206); g.fillText('人差し指=赤 中指=青 薬指=緑 小指=黄', 256, 234); }
+        else g.fillText('文字の色  B赤  A青  X緑  Y黄', 256, 224);
       } else {
         g.fillStyle = tk.stim.go ? '#2fd05a' : '#ff3b30'; g.beginPath(); g.arc(256, 108, 76, 0, Math.PI * 2); g.fill();
-        g.font = `28px ${FONT}`; g.fillStyle = '#cccccc'; g.fillText(tk.stim.go ? '緑: トリガーを押す' : '赤: 押さない', 256, 224);
+        g.font = `28px ${FONT}`; g.fillStyle = '#cccccc'; g.fillText(tk.stim.go ? (handMode ? '緑: 親指と人差し指でつまむ' : '緑: トリガーを押す') : '赤: 押さない', 256, 224);
       }
       show = true;
     } else if (tk.state === 'fb') {
@@ -1292,6 +1305,39 @@ function updateHud(now, dt) {
   if (stimDirty) { stimDirty = false; drawStim(now); }
 }
 function toggleHud() { hudOn = !hudOn; hud.mesh.visible = hudOn; syncUI(); }
+
+/* ---------- 手の追跡 (コントローラーなしで応答。Quest本体のハンドトラッキングをオンにしてください) ---------- */
+const handFactory = new XRHandModelFactory();
+const hands = [0, 1].map(i => {
+  const h = renderer.xr.getHand(i);
+  h.add(handFactory.createHandModel(h, 'spheres'));      // 手を球で表示 (つまんだ位置が見える)
+  dolly.add(h);
+  return { h, st: [false, false, false, false], last: 0 };
+});
+const TIPS = ['index-finger-tip', 'middle-finger-tip', 'ring-finger-tip', 'pinky-finger-tip'];   // 人差し指=赤 中指=青 薬指=緑 小指=黄
+const PINCH_ON = 0.028, PINCH_OFF = 0.045;                                                         // つまむ/離す距離 (m)
+let handMode = false;
+function handPinch(i) {
+  if (task === 'stroop') taskResponse(i);
+  else if (task === 'gonogo' && i === 0) taskResponse('go');
+}
+function pollHands(now) {
+  const was = handMode;
+  handMode = false;
+  for (const H of hands) {
+    const j = H.h.joints, th = j['thumb-tip'];
+    if (!th || !th.visible) { H.st.fill(false); continue; }
+    handMode = true;
+    const d = TIPS.map(n => (j[n] && j[n].visible ? th.position.distanceTo(j[n].position) : 9));
+    let mi = 0; for (let i = 1; i < 4; i++) if (d[i] < d[mi]) mi = i;
+    for (let i = 0; i < 4; i++) {
+      const alone = i === mi && d.every((v, k) => k === i || v > d[i] + 0.012);     // 他の指が近いとき(握りこぶし)は無視
+      if (!H.st[i] && d[i] < PINCH_ON && alone && now - H.last > 0.3) { H.st[i] = true; H.last = now; handPinch(i); }
+      else if (H.st[i] && d[i] > PINCH_OFF) H.st[i] = false;
+    }
+  }
+  if (was !== handMode) stimDirty = true;
+}
 
 /* ---------- VRコントローラーの操作 ---------- */
 const padPrev = {};
@@ -1313,7 +1359,9 @@ function pollPads() {
     gp.buttons.forEach((b, i) => { pv.b[i] = b.pressed; });
   }
 }
-renderer.xr.addEventListener('sessionstart', () => { ensureAudio(); stepDet.lp = null; });
+let autoRec = params.get('autorec') !== '0';       // VRに入ると記録開始、出ると記録停止
+renderer.xr.addEventListener('sessionstart', () => { ensureAudio(); stepDet.lp = null; if (autoRec && !rec.on) startRec(); });
+renderer.xr.addEventListener('sessionend', () => { if (rec.on) stopRec(); });
 
 /* ---------- 操作パネル ---------- */
 const $ = id => document.getElementById(id);
@@ -1328,6 +1376,7 @@ $('hudBtn').addEventListener('click', toggleHud);
 $('goalBtn').addEventListener('click', () => { goalTheme = !goalTheme; syncUI(); });
 $('recBtn').addEventListener('click', toggleRec);
 $('csvBtn').addEventListener('click', downloadCSV);
+$('autoBtn').addEventListener('click', () => { autoRec = !autoRec; syncUI(); });
 function syncUI() {
   lvBtns.forEach((b, i) => b.classList.toggle('on', i + 1 === level));
   taskBtns.forEach((b, i) => b.classList.toggle('on', TASKS[i] === task));
@@ -1338,9 +1387,10 @@ function syncUI() {
   set('hudBtn', `HUD ${hudOn ? 'ON' : 'OFF'}`, hudOn);
   set('goalBtn', `目標で景色変更 ${goalTheme ? 'ON' : 'OFF'}`, goalTheme);
   set('recBtn', rec.on ? '■ 記録停止' : '● 記録開始', rec.on);
+  set('autoBtn', `VR入退出で自動記録 ${autoRec ? 'ON' : 'OFF'}`, autoRec);
   const u = new URL(location.href);
   u.searchParams.set('level', level); u.searchParams.set('task', task); u.searchParams.set('cue', cueOn ? bpm : 0);
-  u.searchParams.set('legs', legsOn ? 1 : 0); u.searchParams.set('hud', hudOn ? 1 : 0); u.searchParams.set('goaltheme', goalTheme ? 1 : 0);
+  u.searchParams.set('legs', legsOn ? 1 : 0); u.searchParams.set('hud', hudOn ? 1 : 0); u.searchParams.set('goaltheme', goalTheme ? 1 : 0); u.searchParams.set('autorec', autoRec ? 1 : 0);
   history.replaceState(null, '', u);
 }
 
@@ -1351,7 +1401,7 @@ function updateRehab(dt, speed) {
   lastRehabT = now;
   if (renderer.xr.isPresenting) detectStep(camera.position.y, dt, now); else simSteps(now, walking);
   M.dist += Math.abs(speed) * dt; if (walking) M.walkT += rdt;
-  updateCue(); updateTask(now); updateLegs(now); checkGoal(); checkEncounters(); pollPads();
+  updateCue(); updateTask(now); updateLegs(now); checkGoal(); checkEncounters(); pollPads(); pollHands(now);
   recordSample(dt, speed, now); updateHud(now, dt);
   hud.mesh.visible = hudOn;
 }
