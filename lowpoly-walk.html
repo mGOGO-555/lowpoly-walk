@@ -1308,12 +1308,27 @@ function toggleHud() { hudOn = !hudOn; hud.mesh.visible = hudOn; syncUI(); }
 
 /* ---------- 手の追跡 (コントローラーなしで応答。Quest本体のハンドトラッキングをオンにしてください) ---------- */
 const handFactory = new XRHandModelFactory();
+const HAND_PATH = 'https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/generic-hand/';
+const HAND_COLOR = '#' + (params.get('handcolor') || 'e8b898').replace('#', '');        // 手の色 (肌色)。?handcolor=c99a7a のように変えられます
 const hands = [0, 1].map(i => {
   const h = renderer.xr.getHand(i);
-  h.add(handFactory.createHandModel(h, 'spheres'));      // 手を球で表示 (つまんだ位置が見える)
   dolly.add(h);
-  return { h, st: [false, false, false, false], last: 0 };
+  return { h, st: [false, false, false, false], last: 0, model: null, tinted: false };
 });
+// 手の見た目: 既定は人の手の形 (mesh)。?hand=spheres で球、モデルを読み込めないときも球にする
+(async () => {
+  let style = params.get('hand') === 'spheres' ? 'spheres' : 'mesh';
+  if (style === 'mesh') { try { const r = await fetch(HAND_PATH + 'left.glb', { method: 'HEAD' }); if (!r.ok) style = 'spheres'; } catch (e) { style = 'spheres'; } }
+  handFactory.setPath(HAND_PATH);
+  hands.forEach(H => { H.style = style; H.model = handFactory.createHandModel(H.h, style); H.h.add(H.model); });
+})();
+function tintHands() {                                   // 読み込み後の手のモデルに肌色を付ける
+  for (const H of hands) {
+    if (H.tinted || !H.model || H.style !== 'mesh') continue;
+    let m = null; H.model.traverse(o => { if (o.isSkinnedMesh) m = o; });
+    if (m) { m.material = m.material.clone(); m.material.color.set(HAND_COLOR); m.material.metalness = 0; m.material.roughness = 0.8; H.tinted = true; }
+  }
+}
 const TIPS = ['index-finger-tip', 'middle-finger-tip', 'ring-finger-tip', 'pinky-finger-tip'];   // 人差し指=赤 中指=青 薬指=緑 小指=黄
 const PINCH_ON = 0.028, PINCH_OFF = 0.045;                                                         // つまむ/離す距離 (m)
 let handMode = false;
@@ -1322,6 +1337,7 @@ function handPinch(i) {
   else if (task === 'gonogo' && i === 0) taskResponse('go');
 }
 function pollHands(now) {
+  tintHands();
   const was = handMode;
   handMode = false;
   for (const H of hands) {
