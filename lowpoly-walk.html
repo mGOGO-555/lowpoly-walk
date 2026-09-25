@@ -26,6 +26,17 @@
     padding: 4px 10px; font-size: 12px; cursor: pointer;
   }
   #toggles button.on { background: #3a8a5a; }
+  #panel { max-height: calc(100vh - 44px); overflow-y: auto; }
+  #rehab { margin-top: 8px; padding-top: 6px; border-top: 1px solid #666; }
+  #rehab .row { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  #rehab button {
+    background: #55556a; color: #fff; border: 0; border-radius: 6px;
+    padding: 4px 9px; font-size: 12px; cursor: pointer;
+  }
+  #rehab button.on { background: #3a8a5a; }
+  #rehab #recBtn.on { background: #c0392b; }
+  #rehab small { color: #bbb; line-height: 1.5; display: block; margin-top: 6px; }
+  #lvBtns, #taskBtns { display: inline-flex; gap: 4px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -38,6 +49,16 @@
   URL指定: <kbd>?theme=winter&amp;seed=7&amp;npc=0&amp;events=0</kbd>
   <div id="themes"></div>
   <div id="toggles"><button id="tgNpc"></button><button id="tgEvt"></button></div>
+  <div id="rehab">
+    <b>リハビリ機能</b>
+    <div class="row"><span>レベル</span><span id="lvBtns"></span></div>
+    <div class="row"><span>課題</span><span id="taskBtns"></span></div>
+    <div class="row"><button id="cueBtn"></button><button id="bpmDn">−</button><span id="bpmVal"></span><button id="bpmUp">＋</button></div>
+    <div class="row"><button id="legBtn"></button><button id="hudBtn"></button><button id="goalBtn"></button></div>
+    <div class="row"><button id="recBtn"></button><button id="csvBtn">CSV保存</button></div>
+    <small>PC: <kbd>W</kbd>で歩くと歩数を擬似カウント / <kbd>R</kbd> 記録 / ストループ <kbd>Z</kbd>赤 <kbd>X</kbd>青 <kbd>C</kbd>緑 <kbd>V</kbd>黄 / Go/NoGo <kbd>Space</kbd><br>
+    VR: 右A=青 右B=赤 左X=緑 左Y=黄 / トリガー=Go / 左スティック上下=レベル / 右スティック上下=歩調 / 右スティック押込=記録 / 左スティック押込=HUD</small>
+  </div>
   <div id="status"></div>
 </div>
 
@@ -142,6 +163,16 @@ let speedMult = 1;
 let npcOn = params.get('npc') !== '0';        // 歩行者
 let eventsOn = params.get('events') !== '0';  // 落とし物・穴・水たまり
 const SLOT = 22;                               // 道の上の出来事の間隔 (m)
+// レベル: npc=歩行者の最大数 / npcEvery=歩行者が現れる間隔(秒) / skip=道の上に何も無い区間の割合 / curve=道の曲がり具合 / goal=目標距離(m)
+const LEVELS = [
+  { npc: 1, npcEvery: 25, skip: 0.75, curve: 0.4, goal: 50 },
+  { npc: 2, npcEvery: 20, skip: 0.60, curve: 0.7, goal: 100 },
+  { npc: 3, npcEvery: 15, skip: 0.45, curve: 1.0, goal: 150 },
+  { npc: 4, npcEvery: 12, skip: 0.30, curve: 1.3, goal: 200 },
+  { npc: 4, npcEvery: 8,  skip: 0.15, curve: 1.6, goal: 300 },
+];
+let level = Math.min(5, Math.max(1, parseInt(params.get('level') ?? '3', 10) || 3));
+let curveK = LEVELS[level - 1].curve;
 
 /* ========== 乱数・ノイズ (シード対応) ========== */
 function hash2(ix, iz) {
@@ -181,7 +212,7 @@ const fr = x => x - Math.floor(x);
 const jit = (x, y, z, k) => fr(Math.sin(x * 12.9898 + y * 78.233 + z * 37.719 + k * 4.1) * 43758.5453) - 0.5;
 
 /* ========== 地形の高さ関数 (テーマごとに起伏が変わる) ========== */
-const pathX = z => Math.sin(z * 0.03 + seed) * 18 + Math.sin(z * 0.008 + seed * 0.3) * 34 + Math.sin(z * 0.075 + seed * 2.1) * 4;
+const pathX = z => (Math.sin(z * 0.03 + seed) * 18 + Math.sin(z * 0.008 + seed * 0.3) * 34 + Math.sin(z * 0.075 + seed * 2.1) * 4) * curveK;
 function heightAt(x, z) {
   const T = TH.terrain;
   const hill = (fbm(x * T.freq, z * T.freq) - T.off) * T.amp + fbm(x * 0.06, z * 0.06, 2) * T.detail;
@@ -517,6 +548,21 @@ function instanced(geo, mat, items, colors) {
   return m;
 }
 
+// 道の上の出来事: 区間番号 k から、種類と位置を決める (毎回同じ結果)
+function eventAt(k) {
+  const skip = LEVELS[level - 1].skip, h = hash2(k, 1234);
+  if (h < skip) return null;
+  const zc = k * SLOT + (hash2(k, 31) - 0.5) * 10;
+  if (Math.abs(zc) < 8) return null;                                   // スタート地点のそばは空ける
+  const xc = pathX(zc) + (hash2(k, 77) - 0.5) * 3.4;
+  const u = (h - skip) / (1 - skip), desert = TH.shape === 'desert';
+  let kind;
+  if (u < 0.25 || (u < 0.44 && desert)) kind = 'pothole';
+  else if (u < 0.44) kind = 'puddle';
+  else { const r2 = hash2(k, 55); kind = r2 < 0.3 ? 'cone' : r2 < 0.55 ? 'box' : r2 < 0.8 ? 'pack' : 'wallet'; }
+  return { k, kind, xc, zc };
+}
+
 function buildChunk(cx, cz) {
   const group = new THREE.Group();
   const ox = cx * CHUNK, oz = cz * CHUNK, G = TH.ground;
@@ -615,34 +661,31 @@ function buildChunk(cx, cz) {
   if (eventsOn) {
     const k0 = Math.floor((oz - 6) / SLOT), k1 = Math.ceil((oz + CHUNK + 6) / SLOT);
     for (let k = k0; k <= k1; k++) {
-      const h = hash2(k, 1234);
-      if (h < 0.28) continue;                                   // 何もない区間
-      const zc = k * SLOT + (hash2(k, 31) - 0.5) * 10;
-      if (Math.abs(zc) < 8) continue;                           // スタート地点のそばは空ける
-      const xc = pathX(zc) + (hash2(k, 77) - 0.5) * 3.4;
+      const ev = eventAt(k);
+      if (!ev) continue;
+      const { xc, zc, kind } = ev;
       const lx = xc - ox, lz = zc - oz;
       if (lx < 0 || lx >= CHUNK || lz < 0 || lz >= CHUNK) continue;
       const y = ground(lx, lz);
       const tilt = new THREE.Quaternion().setFromUnitVectors(UP, _gn);
       const yaw = hash2(k, 5) * 6.28, ci = hash2(k, 9), sa = hash2(k, 13), sb = hash2(k, 14);
       const decalQ = tilt.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, yaw));
-      if (h < 0.46 || (h < 0.6 && desert)) {                    // 穴 (縁に小石)
+      if (kind === 'pothole') {                                 // 穴 (縁に小石)
         const s = 1.5 + sa * 0.9;
         potholes.push({ x: xc, y: y + 0.06, z: zc, sx: s, sy: 1, sz: s * (0.8 + sb * 0.4), q: decalQ });
         for (let n = 0; n < 6; n++) {
           const a = n / 6 * 6.28 + sb * 3, R = 0.62 * s;
           rocks.push({ x: xc + Math.cos(a) * R, y: y - 0.02, z: zc + Math.sin(a) * R, s: 0.12 + hash2(k, 40 + n) * 0.14, ry: a, ci: hash2(k, 60 + n) });
         }
-      } else if (h < 0.6) {                                     // 水たまり
+      } else if (kind === 'puddle') {                           // 水たまり
         const s = 2 + sa * 1.6;
         puddles.push({ x: xc, y: y + 0.05, z: zc, sx: s, sy: 1, sz: s * (0.55 + sb * 0.25), q: decalQ });
       } else {                                                  // 落とし物
-        const r2 = hash2(k, 55);
-        if (r2 < 0.3) {
+        if (kind === 'cone') {
           const fallen = ci < 0.45;
           itemLists.cone.push({ x: xc, y: fallen ? y + 0.12 : y, z: zc, s: 1, ry: yaw, rz: fallen ? 1.45 : 0, ci });
-        } else if (r2 < 0.55) itemLists.box.push({ x: xc, y, z: zc, s: 1, ry: yaw, ci });
-        else if (r2 < 0.8) itemLists.pack.push({ x: xc, y: y + 0.08, z: zc, s: 1, ry: yaw, rz: 1.2, ci });
+        } else if (kind === 'box') itemLists.box.push({ x: xc, y, z: zc, s: 1, ry: yaw, ci });
+        else if (kind === 'pack') itemLists.pack.push({ x: xc, y: y + 0.08, z: zc, s: 1, ry: yaw, rz: 1.2, ci });
         else itemLists.wallet.push({ x: xc, y: y + 0.02, z: zc, s: 1.6, ry: yaw, ci });
         addShadow(xc, y, zc, 1.3);
       }
@@ -823,6 +866,7 @@ function applyTheme(key, instant = false) {
   points.visible = !!TH.particles;
 
   themesEl.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.key === key));
+  logRow('event', { note: `theme=${key}` });
   const url = new URL(location.href);
   url.searchParams.set('theme', key);
   history.replaceState(null, '', url);
@@ -837,7 +881,6 @@ for (let i = 0; i < 2; i++) {
 }
 
 /* ========== 歩行者 (向こうから歩いてくる人) ========== */
-const NPC_MAX = 4;
 const npcs = [];
 let npcTimer = 12;
 const _nf = new THREE.Vector3();
@@ -876,23 +919,26 @@ function updateNPC(n, dt) {
   const sw = Math.sin(n.phase) * 0.55;
   n.legL.rotation.x = sw; n.legR.rotation.x = -sw; n.armL.rotation.x = -sw * 0.8; n.armR.rotation.x = sw * 0.8;
   n.g.position.set(x, y + Math.abs(Math.cos(n.phase)) * 0.02, n.z);
+  const dPl = Math.hypot(x - dolly.position.x, n.z - dolly.position.z); if (dPl < n.minD) n.minD = dPl;
   n.g.rotation.y = Math.atan2(pathX(n.z + sgn) - pathX(n.z), sgn);   // 道に沿って進行方向を向く
 }
 function spawnNPC(dist = 60, sign = null) {
-  if (!npcOn || npcs.length >= NPC_MAX) return;
+  if (!npcOn || npcs.length >= LEVELS[level - 1].npc) return;
   if (sign === null) { camera.getWorldDirection(_nf); sign = _nf.z <= 0 ? -1 : 1; }
   const n = makeNPC(), speed = 1.1 + Math.random() * 0.5;
   n.z = dolly.position.z + sign * dist; n.vz = -sign * speed; n.speed = speed;
-  n.lat = (Math.random() < 0.5 ? -1 : 1) * (0.7 + Math.random() * 1.0); n.phase = Math.random() * 6.28;
+  n.lat = (Math.random() < 0.5 ? -1 : 1) * (0.7 + Math.random() * 1.0); n.phase = Math.random() * 6.28; n.minD = 1e9;
   scene.add(n.g); npcs.push(n); updateNPC(n, 0);
 }
 function removeNPC(i) {
-  const n = npcs[i]; scene.remove(n.g); n.mats.forEach(m => m.dispose()); npcs.splice(i, 1);
+  const n = npcs[i];
+  if (rec.on && n.minD < 1e8) { rec.npcPass++; logRow('event', { note: `npc_pass min_dist=${n.minD.toFixed(1)}m` }); }
+  scene.remove(n.g); n.mats.forEach(m => m.dispose()); npcs.splice(i, 1);
 }
 function updateNPCs(dt) {
   if (!npcOn) return;
   npcTimer -= dt;
-  if (npcTimer <= 0) { spawnNPC(); npcTimer = 10 + Math.random() * 15; }
+  if (npcTimer <= 0) { spawnNPC(); npcTimer = LEVELS[level - 1].npcEvery * (0.7 + Math.random() * 0.6); }
   for (let i = npcs.length - 1; i >= 0; i--) {
     const n = npcs[i];
     updateNPC(n, dt);
@@ -919,6 +965,397 @@ const toggleEvents = () => { eventsOn = !eventsOn; syncToggles(); applyTheme(the
 tgNpc.addEventListener('click', toggleNpc);
 tgEvt.addEventListener('click', toggleEvents);
 
+/* ========== リハビリ機能 ========== */
+const STEP_AMP = 0.006;   // 1歩と判定する頭の上下振幅 (m)。小さいほど敏感 (足踏みを拾わないときは下げる)
+const FONT = "'Noto Sans JP','Hiragino Sans','Yu Gothic UI','Meiryo',sans-serif";
+const nowS = () => performance.now() / 1000;
+const fmtTime = s => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+/* ---------- 歩行指標 (頭の上下動から歩数を検出) ---------- */
+const M = { steps: 0, dist: 0, walkT: 0, times: [] };        // 歩数・距離・歩行時間・各歩の時刻
+const stepDet = { lp: null, armed: false, last: -1 };
+let sampleT = 0;
+
+const rec = { on: false, t0: 0, tEnd: 0, rows: [], enc: new Set(), counts: {}, npcPass: 0, intervals: [], summary: null, start: '' };
+const COLS = ['t_s', 'type', 'theme', 'level', 'x', 'z', 'speed_mps', 'steps', 'cadence_spm', 'target_bpm', 'cv_pct', 'task', 'stim', 'response', 'correct', 'rt_ms', 'note'];
+function logRow(type, o = {}) {
+  if (!rec.on) return;
+  rec.rows.push([
+    (nowS() - rec.t0).toFixed(3), type, themeKey, level,
+    dolly.position.x.toFixed(2), dolly.position.z.toFixed(2), o.speed ?? '', M.steps, o.cad ?? '',
+    cueOn ? bpm : '', o.cv ?? '', task, o.stim ?? '', o.resp ?? '', o.correct ?? '', o.rt ?? '', o.note ?? '',
+  ]);
+}
+function cadence(now) {
+  const T = M.times;
+  if (T.length < 3 || now - T[T.length - 1] > 2.5) return 0;
+  const n = Math.min(T.length, 8);
+  return (n - 1) / (T[T.length - 1] - T[T.length - n]) * 60;
+}
+function cvOf(iv) {
+  if (iv.length < 5) return null;
+  const m = iv.reduce((s, v) => s + v, 0) / iv.length;
+  return Math.sqrt(iv.reduce((s, v) => s + (v - m) ** 2, 0) / iv.length) / m * 100;
+}
+function stepCV() {
+  const T = M.times, iv = [];
+  for (let i = Math.max(1, T.length - 20); i < T.length; i++) if (T[i] - T[i - 1] < 1.5) iv.push(T[i] - T[i - 1]);
+  return cvOf(iv);
+}
+function onStep(now) {
+  const prev = M.times[M.times.length - 1];
+  M.steps++; M.times.push(now);
+  if (M.times.length > 400) M.times.shift();
+  if (rec.on && prev !== undefined && now - prev < 1.5) rec.intervals.push(now - prev);
+  legStep(now);
+  logRow('step');
+}
+function detectStep(y, dt, now) {                // 頭の高さから、ゆっくりした変化を引いて上下動だけを取り出す
+  if (stepDet.lp === null) stepDet.lp = y;
+  stepDet.lp += (y - stepDet.lp) * (1 - Math.exp(-dt / 0.6));
+  const hp = y - stepDet.lp;
+  if (hp < -STEP_AMP * 0.4) stepDet.armed = true;
+  if (stepDet.armed && hp > STEP_AMP && now - stepDet.last > 0.25) { stepDet.armed = false; stepDet.last = now; onStep(now); }
+}
+let simNext = 0;
+function simSteps(now, walking) {                // PC確認用: Wキー中は100歩/分で擬似的に歩数を数える
+  if (!walking) { simNext = 0; return; }
+  if (simNext === 0) simNext = now;
+  if (now >= simNext) { onStep(now); simNext += 0.6 + (Math.random() - 0.5) * 0.06; }
+}
+
+/* ---------- リズムキュー (メトロノーム) ---------- */
+let cueOn = params.get('cue') !== null && params.get('cue') !== '0';
+let bpm = Math.min(160, Math.max(40, parseInt(params.get('cue'), 10) || 100));
+let audioCtx = null, beatRef = 0, nextBeat = 0;
+function ensureAudio() {
+  if (!audioCtx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) audioCtx = new AC(); }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+function scheduleTick(t, freq = 880, vol = 0.3, dur = 0.06) {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = 'sine'; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.005); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+function chime() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  scheduleTick(t, 660, 0.25, 0.25); scheduleTick(t + 0.14, 880, 0.25, 0.25); scheduleTick(t + 0.28, 1175, 0.25, 0.4);
+}
+const cueClock = () => (audioCtx ? audioCtx.currentTime : performance.now() / 1000);
+const beatDot = new THREE.Mesh(new THREE.CircleGeometry(0.022, 24), new THREE.MeshBasicMaterial({ color: 0xffd060, transparent: true, depthTest: false, depthWrite: false, toneMapped: false, fog: false }));
+beatDot.position.set(-0.235, -0.245, -1.1); beatDot.renderOrder = 1000; camera.add(beatDot);
+function updateCue() {
+  beatDot.visible = cueOn && hudOn;
+  if (!cueOn) { beatRef = 0; return; }
+  const c = cueClock(), period = 60 / bpm;
+  if (beatRef === 0) { beatRef = c + 0.1; nextBeat = beatRef; }
+  while (nextBeat < c + 0.12) { scheduleTick(nextBeat); nextBeat += period; }
+  const ph = ((c - beatRef) % period + period) % period;
+  beatDot.material.opacity = ph < 0.18 ? 1 - ph / 0.18 * 0.85 : 0.15;
+}
+function bpmStep(d) { bpm = Math.min(160, Math.max(40, bpm + d)); beatRef = 0; syncUI(); }
+function setCue(on) { cueOn = on; beatRef = 0; if (on) ensureAudio(); syncUI(); }
+
+/* ---------- 歩行中の課題 (二重課題) ---------- */
+const TASKS = ['off', 'stroop', 'gonogo', 'verbal'];
+const TASK_LABEL = { off: 'なし', stroop: 'ストループ', gonogo: 'Go/NoGo', verbal: '口頭' };
+let task = TASKS.includes(params.get('task')) ? params.get('task') : 'off';
+const INK = [{ n: '赤', c: '#ff3b30' }, { n: '青', c: '#2f7bff' }, { n: '緑', c: '#2fd05a' }, { n: '黄', c: '#ffd60a' }];
+// 応答: 赤=右B / 青=右A / 緑=左X / 黄=左Y (PCは Z X C V)。Go/NoGoはトリガー (PCはスペース)
+const VERBAL = ['100から7ずつ/引いていく', '200から3ずつ/引いていく', '動物の名前を/たくさん言う', '「か」で始まる/言葉を言う'];
+const tk = { state: 'idle', next: 0, stim: null, onset: 0, fbEnd: 0, ok: false, n: 0, hit: 0, rtSum: 0, rtN: 0, vNext: 0, vText: '' };
+let stimDirty = true, toastText = '', toastUntil = 0;
+function taskReset() { tk.state = 'idle'; tk.next = nowS() + 3; tk.stim = null; tk.n = tk.hit = tk.rtSum = tk.rtN = 0; tk.vNext = 0; stimDirty = true; }
+function toast(t, sec = 3) { toastText = t; toastUntil = nowS() + sec; stimDirty = true; }
+function resolveTrial(resp, now) {
+  const s = tk.stim, rt = resp === null ? null : (now - tk.onset) * 1000;
+  const correct = task === 'stroop' ? resp === s.ink : (s.go ? resp === 'go' : resp === null);
+  tk.n++; if (correct) { tk.hit++; if (rt !== null) { tk.rtSum += rt; tk.rtN++; } }
+  logRow('task', {
+    stim: task === 'stroop' ? `${INK[s.word].n}/${INK[s.ink].n}` : (s.go ? 'go' : 'nogo'),
+    resp: resp === null ? '' : (task === 'stroop' ? INK[resp].n : 'go'), correct: correct ? 1 : 0, rt: rt === null ? '' : rt.toFixed(0),
+  });
+  tk.ok = correct; tk.state = 'fb'; tk.fbEnd = now + 0.6; stimDirty = true;
+}
+function taskResponse(val) {
+  if (tk.state !== 'stim') return;
+  if (task === 'stroop' && typeof val !== 'number') return;
+  if (task === 'gonogo' && val !== 'go') return;
+  resolveTrial(val, nowS());
+}
+function updateTask(now) {
+  if (task === 'off') return;
+  if (task === 'verbal') {
+    if (now >= tk.vNext) { tk.vText = VERBAL[Math.floor(Math.random() * VERBAL.length)]; tk.vNext = now + 40; stimDirty = true; logRow('task', { stim: tk.vText.replace('/', ''), note: 'prompt' }); }
+    return;
+  }
+  if (tk.state === 'idle' && now >= tk.next) {
+    if (task === 'stroop') { const w = Math.floor(Math.random() * 4); const ink = Math.random() < 0.5 ? w : (w + 1 + Math.floor(Math.random() * 3)) % 4; tk.stim = { word: w, ink }; }
+    else tk.stim = { go: Math.random() < 0.75 };
+    tk.state = 'stim'; tk.onset = now; stimDirty = true;
+  } else if (tk.state === 'stim' && now - tk.onset > (task === 'stroop' ? 3.0 : 1.2)) resolveTrial(null, now);
+  else if (tk.state === 'fb' && now >= tk.fbEnd) { tk.state = 'idle'; tk.next = now + 1.5 + Math.random() * 2; stimDirty = true; }
+}
+function setTask(t) { task = t; taskReset(); syncUI(); }
+
+/* ---------- 仮想の脚 (足踏みに合わせて動く。運動錯覚の実験用に左右の大きさ・遅れを変えられる) ---------- */
+let legsOn = params.get('legs') !== '0';
+const legGain = [parseFloat(params.get('legL') ?? '1'), parseFloat(params.get('legR') ?? '1')];   // 左・右の動きの大きさ
+const legDelay = parseFloat(params.get('legDelay') ?? '0') / 1000;                                 // 映像の遅れ (ms)
+const legRoot = new THREE.Group(); scene.add(legRoot);
+const pantsMat = new THREE.MeshLambertMaterial({ color: 0x2a2f3a }), shoeMat = new THREE.MeshLambertMaterial({ color: 0xf0f0f0 });
+const thighGeo = new THREE.CapsuleGeometry(0.08, 0.29, 3, 8).translate(0, -0.225, 0);
+const shinGeo = new THREE.CapsuleGeometry(0.065, 0.3, 3, 8).translate(0, -0.21, 0);
+const footGeo = new THREE.BoxGeometry(0.1, 0.06, 0.26).translate(0, -0.03, 0.07);
+function makeLeg(side) {
+  const hip = new THREE.Group(); hip.position.set(side * 0.1, 0.9, 0); legRoot.add(hip);
+  hip.add(new THREE.Mesh(thighGeo, pantsMat));
+  const knee = new THREE.Group(); knee.position.set(0, -0.45, 0); hip.add(knee);
+  knee.add(new THREE.Mesh(shinGeo, pantsMat));
+  const foot = new THREE.Mesh(footGeo, shoeMat); foot.position.set(0, -0.42, 0); knee.add(foot);
+  return { hip, knee, foot, t0: -10, pend: [] };
+}
+const legs = [makeLeg(-1), makeLeg(1)];    // [左, 右]
+const _lp = new THREE.Vector3(), _ld = new THREE.Vector3();
+let legYaw = 0;
+function legStep(now) { legs[M.steps % 2].pend.push(now + legDelay); }
+function updateLegs(now) {
+  legRoot.visible = legsOn;
+  if (!legsOn) return;
+  camera.getWorldPosition(_lp); camera.getWorldDirection(_ld);
+  legRoot.scale.setScalar(Math.max(1.0, camera.position.y) * 0.53 / 0.9);
+  legRoot.position.set(_lp.x, dolly.position.y, _lp.z);
+  if (Math.hypot(_ld.x, _ld.z) > 0.25) legYaw = Math.atan2(_ld.x, _ld.z);
+  legRoot.rotation.y = legYaw;
+  for (let i = 0; i < 2; i++) {
+    const L = legs[i];
+    while (L.pend.length && now >= L.pend[0]) L.t0 = L.pend.shift();
+    const t = (now - L.t0) / 0.45, lift = t >= 0 && t < 1 ? Math.sin(Math.PI * t) : 0, g = legGain[i];
+    L.hip.rotation.x = -0.9 * lift * g; L.knee.rotation.x = 1.5 * lift * g; L.foot.rotation.x = -0.4 * lift * g;
+  }
+}
+
+/* ---------- レベル・目標 ---------- */
+let goalTheme = params.get('goaltheme') !== '0';
+let goalBase = 0;
+function setLevel(l) {
+  l = Math.min(5, Math.max(1, l));
+  if (l === level) return;
+  level = l; curveK = LEVELS[l - 1].curve;
+  while (npcs.length > LEVELS[l - 1].npc) removeNPC(npcs.length - 1);
+  goalBase = M.dist;
+  dolly.position.x = pathX(dolly.position.z);
+  applyTheme(themeKey);
+  logRow('event', { note: `level=${l}` });
+  toast(`レベル ${l}`, 2); syncUI();
+}
+function checkGoal() {
+  const g = LEVELS[level - 1].goal;
+  if (M.dist - goalBase < g) return;
+  goalBase += g; chime(); toast(`目標 ${g} m 達成!`, 4);
+  logRow('event', { note: `goal ${g}m` });
+  if (goalTheme) nextTheme();
+}
+
+/* ---------- 記録・CSV ---------- */
+function resetMetrics() { M.steps = 0; M.dist = 0; M.walkT = 0; M.times = []; goalBase = 0; }
+function startRec() {
+  resetMetrics(); taskReset();
+  Object.assign(rec, { on: true, t0: nowS(), rows: [], intervals: [], summary: null, npcPass: 0, start: new Date().toISOString() });
+  rec.enc.clear(); rec.counts = { pothole: 0, puddle: 0, cone: 0, box: 0, pack: 0, wallet: 0 };
+  logRow('event', { note: 'record start' });
+  toast('記録を開始', 2); syncUI();
+}
+function summarize() {
+  const dur = (rec.on ? nowS() : rec.tEnd) - rec.t0;
+  return {
+    duration_s: dur.toFixed(1), steps: M.steps, distance_m: M.dist.toFixed(1), walk_time_s: M.walkT.toFixed(1),
+    cadence_mean_spm: M.walkT > 1 ? (M.steps / M.walkT * 60).toFixed(1) : '', step_interval_cv_pct: (cvOf(rec.intervals) ?? '') === '' ? '' : cvOf(rec.intervals).toFixed(1),
+    task: task, task_trials: tk.n, task_correct: tk.hit, task_mean_rt_ms: tk.rtN ? (tk.rtSum / tk.rtN).toFixed(0) : '',
+    encounter_pothole: rec.counts.pothole, encounter_puddle: rec.counts.puddle, encounter_cone: rec.counts.cone,
+    encounter_box: rec.counts.box, encounter_backpack: rec.counts.pack, encounter_wallet: rec.counts.wallet, npc_passes: rec.npcPass,
+  };
+}
+function stopRec() {
+  if (!rec.on) return;
+  logRow('event', { note: 'record stop' });
+  rec.tEnd = nowS(); rec.summary = summarize(); rec.on = false;
+  toast(`記録終了 歩数${M.steps} ${M.dist.toFixed(0)}m`, 6); syncUI();
+}
+const toggleRec = () => (rec.on ? stopRec() : startRec());
+function buildCSV() {
+  const s = rec.summary || (rec.rows.length ? summarize() : null);
+  const head = ['# lowpoly-walk record', `# start,${rec.start}`, `# seed,${seed}`, `# events_on,${eventsOn}`, `# npc_on,${npcOn}`, `# cue_bpm,${cueOn ? bpm : 'off'}`, `# legs,${legsOn}`, `# legL,${legGain[0]}`, `# legR,${legGain[1]}`, `# legDelay_ms,${legDelay * 1000}`];
+  if (s) for (const k in s) head.push(`# ${k},${s[k]}`);
+  return head.concat([COLS.join(',')], rec.rows.map(r => r.join(','))).join('\n');
+}
+function downloadCSV() {
+  if (!rec.rows.length) { toast('記録がありません', 2); return; }
+  const blob = new Blob(['﻿' + buildCSV()], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `lowpoly-walk_${rec.start.replace(/[:.]/g, '-')}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function checkEncounters() {          // 道の上の穴・落とし物の近くを通ったら記録する
+  if (!rec.on || !eventsOn) return;
+  const z = dolly.position.z;
+  for (let k = Math.floor((z - 4) / SLOT); k <= Math.ceil((z + 4) / SLOT); k++) {
+    const ev = eventAt(k);
+    if (!ev) continue;
+    const d = Math.hypot(ev.xc - dolly.position.x, ev.zc - z), lim = ev.kind === 'puddle' ? 1.8 : ev.kind === 'pothole' ? 1.3 : 1.0;
+    const key = ev.kind + k;
+    if (d < lim && !rec.enc.has(key)) { rec.enc.add(key); rec.counts[ev.kind]++; logRow('event', { note: `encounter ${ev.kind} d=${d.toFixed(2)}m` }); }
+  }
+}
+function recordSample(dt, speed, now) {
+  sampleT += dt;
+  if (sampleT < 0.5) return;
+  sampleT = 0;
+  const cv = stepCV();
+  logRow('sample', { speed: speed.toFixed(2), cad: cadence(now).toFixed(1), cv: cv === null ? '' : cv.toFixed(1) });
+}
+
+/* ---------- VR内の表示 (頭に付いたHUD) ---------- */
+let hudOn = params.get('hud') !== '0';
+function makeCanvasPlane(pw, ph, pos) {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 256;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false, fog: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(pw, ph), mat);
+  mesh.position.set(...pos); mesh.renderOrder = 999; camera.add(mesh);
+  return { g: c.getContext('2d'), tex, mesh };
+}
+const hud = makeCanvasPlane(0.6, 0.3, [-0.5, -0.36, -1.1]);       // 左下: 歩数・歩調など
+const stim = makeCanvasPlane(1.0, 0.5, [0, 0.22, -1.5]);          // 中央上: 課題・お知らせ
+function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+function drawHud(now) {
+  const g = hud.g;
+  g.clearRect(0, 0, 512, 256);
+  g.fillStyle = 'rgba(0,0,0,0.55)'; rr(g, 4, 4, 504, 248, 22); g.fill();
+  g.textBaseline = 'middle'; g.textAlign = 'left';
+  g.font = `bold 34px ${FONT}`; g.fillStyle = rec.on ? '#ff6a6a' : '#bbbbbb';
+  g.fillText(rec.on ? `● REC ${fmtTime(now - rec.t0)}` : '○ 待機中', 22, 40);
+  if (task !== 'off' && task !== 'verbal') { g.font = `bold 30px ${FONT}`; g.fillStyle = '#cfe8ff'; g.fillText(`課題 ${tk.hit}/${tk.n}`, 300, 40); }
+  g.font = `38px ${FONT}`; g.fillStyle = '#ffffff';
+  g.fillText(`歩数 ${M.steps}   距離 ${M.dist.toFixed(0)} m`, 22, 100);
+  const cad = cadence(now);
+  let col = '#ffffff';
+  if (cueOn && cad > 0) { const r = Math.abs(cad - bpm) / bpm; col = r <= 0.1 ? '#5be07a' : r <= 0.2 ? '#ffd24a' : '#ff6a6a'; }
+  g.font = `bold 42px ${FONT}`; g.fillStyle = col;
+  g.fillText(`歩調 ${cad ? cad.toFixed(0) : '--'}${cueOn ? ` / 目標 ${bpm}` : ''}`, 22, 160);
+  const goal = LEVELS[level - 1].goal, cur = Math.max(0, M.dist - goalBase);
+  g.font = `30px ${FONT}`; g.fillStyle = '#dddddd';
+  g.fillText(`Lv${level}   目標 ${cur.toFixed(0)}/${goal} m`, 22, 208);
+  g.fillStyle = 'rgba(255,255,255,0.2)'; g.fillRect(22, 230, 468, 10);
+  g.fillStyle = '#5bc0ff'; g.fillRect(22, 230, 468 * Math.min(1, cur / goal), 10);
+  hud.tex.needsUpdate = true;
+}
+function drawStim(now) {
+  const g = stim.g;
+  g.clearRect(0, 0, 512, 256);
+  let show = false;
+  const panel = a => { g.fillStyle = `rgba(0,0,0,${a})`; rr(g, 4, 4, 504, 248, 26); g.fill(); };
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  if (now < toastUntil) {
+    panel(0.6); g.fillStyle = '#ffe28a'; g.font = `bold 44px ${FONT}`; g.fillText(toastText, 256, 128); show = true;
+  } else if (task === 'verbal' && tk.vText) {
+    panel(0.55); g.fillStyle = '#9ac8ff'; g.font = `28px ${FONT}`; g.fillText('口頭課題', 256, 40);
+    g.fillStyle = '#ffffff'; g.font = `bold 46px ${FONT}`;
+    const ls = tk.vText.split('/'); ls.forEach((t, i) => g.fillText(t, 256, 128 + (i - (ls.length - 1) / 2) * 62)); show = true;
+  } else if (task === 'stroop' || task === 'gonogo') {
+    if (tk.state === 'stim') {
+      panel(0.55);
+      if (task === 'stroop') {
+        g.font = `bold 150px ${FONT}`; g.fillStyle = INK[tk.stim.ink].c; g.fillText(INK[tk.stim.word].n, 256, 108);
+        g.font = `26px ${FONT}`; g.fillStyle = '#cccccc'; g.fillText('文字の色  B赤  A青  X緑  Y黄', 256, 224);
+      } else {
+        g.fillStyle = tk.stim.go ? '#2fd05a' : '#ff3b30'; g.beginPath(); g.arc(256, 108, 76, 0, Math.PI * 2); g.fill();
+        g.font = `28px ${FONT}`; g.fillStyle = '#cccccc'; g.fillText(tk.stim.go ? '緑: トリガーを押す' : '赤: 押さない', 256, 224);
+      }
+      show = true;
+    } else if (tk.state === 'fb') {
+      g.font = `bold 130px ${FONT}`; g.fillStyle = tk.ok ? '#2fd05a' : '#ff3b30'; g.fillText(tk.ok ? '○' : '×', 256, 128); show = true;
+    }
+  }
+  stim.mesh.visible = show; stim.tex.needsUpdate = true;
+}
+let hudT = 0;
+function updateHud(now, dt) {
+  hudT += dt;
+  if (toastUntil && now > toastUntil) { toastUntil = 0; stimDirty = true; }
+  if (hudT > 0.25) { hudT = 0; if (hudOn) drawHud(now); }
+  if (stimDirty) { stimDirty = false; drawStim(now); }
+}
+function toggleHud() { hudOn = !hudOn; hud.mesh.visible = hudOn; syncUI(); }
+
+/* ---------- VRコントローラーの操作 ---------- */
+const padPrev = {};
+function pollPads() {
+  const s = renderer.xr.getSession && renderer.xr.getSession();
+  if (!s) return;
+  for (const src of s.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const hand = src.handedness, pv = padPrev[hand] || (padPrev[hand] = { b: [], y: 0 });
+    const edge = i => gp.buttons[i] && gp.buttons[i].pressed && !pv.b[i];
+    if (edge(0)) taskResponse('go');                                        // トリガー
+    if (hand === 'right') { if (edge(4)) taskResponse(1); if (edge(5)) taskResponse(0); if (edge(3)) toggleRec(); }   // A=青 B=赤 / 右スティック押込=記録
+    if (hand === 'left')  { if (edge(4)) taskResponse(2); if (edge(5)) taskResponse(3); if (edge(3)) toggleHud(); }   // X=緑 Y=黄 / 左スティック押込=HUD
+    const y = gp.axes[3] || 0;
+    if (y < -0.7 && pv.y >= -0.7) (hand === 'right' ? bpmStep(5) : setLevel(level + 1));      // スティック上
+    if (y > 0.7 && pv.y <= 0.7) (hand === 'right' ? bpmStep(-5) : setLevel(level - 1));       // スティック下
+    pv.y = y;
+    gp.buttons.forEach((b, i) => { pv.b[i] = b.pressed; });
+  }
+}
+renderer.xr.addEventListener('sessionstart', () => { ensureAudio(); stepDet.lp = null; });
+
+/* ---------- 操作パネル ---------- */
+const $ = id => document.getElementById(id);
+const mkBtn = (parent, label, fn) => { const b = document.createElement('button'); b.textContent = label; b.addEventListener('click', fn); parent.appendChild(b); return b; };
+const lvBtns = [1, 2, 3, 4, 5].map(l => mkBtn($('lvBtns'), String(l), () => setLevel(l)));
+const taskBtns = TASKS.map(t => mkBtn($('taskBtns'), TASK_LABEL[t], () => setTask(t)));
+$('cueBtn').addEventListener('click', () => setCue(!cueOn));
+$('bpmDn').addEventListener('click', () => bpmStep(-5));
+$('bpmUp').addEventListener('click', () => bpmStep(5));
+$('legBtn').addEventListener('click', () => { legsOn = !legsOn; syncUI(); });
+$('hudBtn').addEventListener('click', toggleHud);
+$('goalBtn').addEventListener('click', () => { goalTheme = !goalTheme; syncUI(); });
+$('recBtn').addEventListener('click', toggleRec);
+$('csvBtn').addEventListener('click', downloadCSV);
+function syncUI() {
+  lvBtns.forEach((b, i) => b.classList.toggle('on', i + 1 === level));
+  taskBtns.forEach((b, i) => b.classList.toggle('on', TASKS[i] === task));
+  const set = (id, text, on) => { const e = $(id); e.textContent = text; e.classList.toggle('on', !!on); };
+  set('cueBtn', `メトロノーム ${cueOn ? 'ON' : 'OFF'}`, cueOn);
+  $('bpmVal').textContent = `${bpm} 歩/分`;
+  set('legBtn', `脚 ${legsOn ? 'ON' : 'OFF'}`, legsOn);
+  set('hudBtn', `HUD ${hudOn ? 'ON' : 'OFF'}`, hudOn);
+  set('goalBtn', `目標で景色変更 ${goalTheme ? 'ON' : 'OFF'}`, goalTheme);
+  set('recBtn', rec.on ? '■ 記録停止' : '● 記録開始', rec.on);
+  const u = new URL(location.href);
+  u.searchParams.set('level', level); u.searchParams.set('task', task); u.searchParams.set('cue', cueOn ? bpm : 0);
+  u.searchParams.set('legs', legsOn ? 1 : 0); u.searchParams.set('hud', hudOn ? 1 : 0); u.searchParams.set('goaltheme', goalTheme ? 1 : 0);
+  history.replaceState(null, '', u);
+}
+
+/* ---------- 毎フレームの更新 ---------- */
+let lastRehabT = 0;
+function updateRehab(dt, speed) {
+  const now = nowS(), walking = Math.abs(speed) > 0.2, rdt = lastRehabT ? Math.min(1, now - lastRehabT) : 0;   // rdt: 実際に経過した時間
+  lastRehabT = now;
+  if (renderer.xr.isPresenting) detectStep(camera.position.y, dt, now); else simSteps(now, walking);
+  M.dist += Math.abs(speed) * dt; if (walking) M.walkT += rdt;
+  updateCue(); updateTask(now); updateLegs(now); checkGoal(); checkEncounters(); pollPads();
+  recordSample(dt, speed, now); updateHud(now, dt);
+  hud.mesh.visible = hudOn;
+}
+
 /* ========== 入力 (PC確認用) ========== */
 const keys = {};
 addEventListener('keydown', e => {
@@ -927,6 +1364,12 @@ addEventListener('keydown', e => {
   if (e.code === 'KeyT') nextTheme();
   if (e.code === 'KeyN') toggleNpc();
   if (e.code === 'KeyE') toggleEvents();
+  if (e.code === 'KeyR') toggleRec();
+  if (e.code === 'KeyZ') taskResponse(0);
+  if (e.code === 'KeyX') taskResponse(1);
+  if (e.code === 'KeyC') taskResponse(2);
+  if (e.code === 'KeyV') taskResponse(3);
+  if (e.code === 'Space') { taskResponse('go'); e.preventDefault(); }
   if (e.code === 'BracketLeft')  speedMult = Math.max(0.25, speedMult - 0.25);
   if (e.code === 'BracketRight') speedMult = Math.min(4, speedMult + 0.25);
   const m = /^Digit([1-9])$/.exec(e.code);
@@ -954,6 +1397,7 @@ let prevHeadY = null, bob = 0, statusTimer = 0, elapsed = 0;
 
 applyTheme(themeKey, true);
 syncToggles();
+taskReset(); syncUI();
 if (npcOn) { spawnNPC(35, -1); spawnNPC(70, -1); }
 
 renderer.setAnimationLoop(() => {
@@ -994,13 +1438,14 @@ renderer.setAnimationLoop(() => {
   pump(1);
   updateParticles(dt, elapsed);
   updateNPCs(dt);
+  updateRehab(dt, speed);
   clouds.position.set(dolly.position.x, 0, dolly.position.z);
   clouds.rotation.y += dt * 0.004;
 
   statusTimer += dt;
   if (statusTimer > 0.3 && !renderer.xr.isPresenting) {
     statusTimer = 0;
-    statusEl.textContent = `テーマ: ${TH.label} / シード: ${seed} / 速度倍率: ×${speedMult.toFixed(2)}`;
+    statusEl.textContent = `テーマ: ${TH.label} / Lv${level} / 歩数 ${M.steps} / ${M.dist.toFixed(0)} m / 歩調 ${cadence(nowS()).toFixed(0)}${rec.on ? ' / ● REC' : ''}`;
   }
 
   renderer.render(scene, camera);
