@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lowpoly Walk</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9a8aa8; font-family: sans-serif; }
+  #panel {
+    position: fixed; top: 12px; left: 12px; max-width: 320px;
+    padding: 10px 14px; border-radius: 10px;
+    background: rgba(40, 40, 50, 0.75); color: #eee; font-size: 12px; line-height: 1.6;
+  }
+  #panel b { font-size: 14px; }
+  #panel kbd { background: #555; border-radius: 3px; padding: 0 4px; }
+  #status { margin-top: 6px; color: #ffd9a0; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <b>Lowpoly Walk</b><br>
+  Quest のブラウザで開いて「ENTER VR」。その場で足踏みすると、見ている方向へ進みます。<br>
+  PC確認: <kbd>W</kbd> 前進 / ドラッグで視点 / <kbd>[</kbd> <kbd>]</kbd> 速度 / <kbd>H</kbd> パネル表示<br>
+  シード変更: URL末尾に <kbd>?seed=7</kbd>
+  <div id="status"></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+/* ========== 調整用パラメータ ========== */
+const STEP_THRESHOLD = 0.12;  // 足踏み判定のしきい値 (頭の上下速度 m/s)。小さいほど敏感
+const STEP_GAIN      = 12;    // 足踏みの強さ → 移動速度への倍率
+const MAX_SPEED      = 4.5;   // 最大移動速度 (m/s)
+const CHUNK          = 40;    // 地形チャンクの大きさ (m)
+const SEG            = 20;    // チャンク分割数
+const RADIUS         = 2;     // プレイヤー周囲に読み込むチャンク数
+
+const params = new URLSearchParams(location.search);
+const seed = parseInt(params.get('seed') ?? '42', 10) || 42;
+let speedMult = 1;
+
+/* ========== 乱数・ノイズ (シード対応) ========== */
+function hash2(ix, iz) {
+  let h = Math.imul(ix, 374761393) ^ Math.imul(iz, 668265263) ^ Math.imul(seed, 1013904223);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const smooth = t => t * t * (3 - 2 * t);
+const lerp = (a, b, t) => a + (b - a) * t;
+function vnoise(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = smooth(x - ix), fz = smooth(z - iz);
+  return lerp(
+    lerp(hash2(ix, iz), hash2(ix + 1, iz), fx),
+    lerp(hash2(ix, iz + 1), hash2(ix + 1, iz + 1), fx),
+    fz
+  );
+}
+function fbm(x, z, oct = 4) {
+  let v = 0, a = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { v += a * vnoise(x * f, z * f); f *= 2; a *= 0.5; }
+  return v;
+}
+const smoothstep = (a, b, x) => smooth(Math.min(1, Math.max(0, (x - a) / (b - a))));
+
+/* ========== 地形の高さ関数 ========== */
+const pathX = z => Math.sin(z * 0.02 + seed) * 15 + Math.sin(z * 0.005 + seed * 0.3) * 30;
+function heightAt(x, z) {
+  const hill = (fbm(x * 0.012, z * 0.012) - 0.35) * 30 + fbm(x * 0.06, z * 0.06, 2) * 2;
+  const pathH = fbm(z * 0.01 + 100, 7.7, 3) * 6;
+  const t = smoothstep(2.5, 9, Math.abs(x - pathX(z)));
+  return lerp(pathH, hill, t);
+}
+
+/* ========== シーン ========== */
+const SKY = new THREE.Color(0x9a8aa8);
+const scene = new THREE.Scene();
+scene.background = SKY;
+scene.fog = new THREE.Fog(SKY, 40, 105);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 300);
+camera.rotation.order = 'YXZ';
+const dolly = new THREE.Group();   // XR空間ではこのグループを動かして移動する
+dolly.add(camera);
+scene.add(dolly);
+camera.position.set(0, 1.6, 0);
+
+scene.add(new THREE.HemisphereLight(0xe8d8ff, 0x6b5a4a, 1.0));
+const sun = new THREE.DirectionalLight(0xffd9a8, 1.6);
+sun.position.set(-60, 80, -40);
+scene.add(sun);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setFoveation?.(1);
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+/* ========== 共有ジオメトリ・マテリアル ========== */
+const trunkGeo = new THREE.CylinderGeometry(0.25, 0.35, 2, 5).translate(0, 1, 0);
+const pineGeo  = new THREE.ConeGeometry(1.6, 5, 6).translate(0, 4.2, 0);
+const leafGeo  = new THREE.IcosahedronGeometry(2.1, 0).translate(0, 3.9, 0);
+const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5a4030, flatShading: true });
+const pineMat  = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true });
+const leafMat  = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true });
+const terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
+
+const PINE_COLORS = [0x2f4a3a, 0x36573f, 0x2a4234].map(c => new THREE.Color(c));
+const LEAF_COLORS = [0xd9822b, 0xc8501e, 0xe0a23a, 0xb3391f, 0xcf6a24].map(c => new THREE.Color(c));
+
+/* ========== チャンク生成 ========== */
+const chunks = new Map();
+const dummy = new THREE.Object3D();
+const tmpColor = new THREE.Color();
+
+function buildChunk(cx, cz) {
+  const group = new THREE.Group();
+  const ox = cx * CHUNK, oz = cz * CHUNK;
+
+  // --- 地形 ---
+  let geo = new THREE.PlaneGeometry(CHUNK, CHUNK, SEG, SEG);
+  geo.rotateX(-Math.PI / 2);
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const wx = p.getX(i) + ox + CHUNK / 2;
+    const wz = p.getZ(i) + oz + CHUNK / 2;
+    p.setXYZ(i, wx - ox, heightAt(wx, wz), wz - oz);
+  }
+  geo = geo.toNonIndexed();
+  const pos = geo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i += 3) {
+    const cxm = (pos.getX(i) + pos.getX(i + 1) + pos.getX(i + 2)) / 3 + ox;
+    const czm = (pos.getZ(i) + pos.getZ(i + 1) + pos.getZ(i + 2)) / 3 + oz;
+    const hm  = (pos.getY(i) + pos.getY(i + 1) + pos.getY(i + 2)) / 3;
+    const d = Math.abs(cxm - pathX(czm));
+    if (d < 3.5) tmpColor.set(0x8a6a55);
+    else if (hm > 11) tmpColor.set(0xc9b7a5);
+    else if (hm > 5) tmpColor.set(0x8a8060).lerp(new THREE.Color(0xc9b7a5), (hm - 5) / 6);
+    else tmpColor.set(0x7a6f66).lerp(new THREE.Color(0x8a8060), Math.max(0, hm / 5));
+    tmpColor.multiplyScalar(0.9 + hash2(Math.floor(cxm * 3), Math.floor(czm * 3)) * 0.2);
+    for (let k = 0; k < 3; k++) tmpColor.toArray(colors, (i + k) * 3);
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const terrain = new THREE.Mesh(geo, terrainMat);
+  terrain.position.set(ox + CHUNK / 2, 0, oz + CHUNK / 2);
+  group.add(terrain);
+
+  // --- 木 (InstancedMesh で描画負荷を抑える) ---
+  const rng = mulberry32(Math.imul(cx, 73856093) ^ Math.imul(cz, 19349663) ^ seed);
+  const trees = [];
+  for (let n = 0; n < 16; n++) {
+    const x = ox + rng() * CHUNK, z = oz + rng() * CHUNK;
+    const s = 0.8 + rng() * 0.9, ry = rng() * Math.PI * 2, type = rng() < 0.5, ci = rng();
+    if (Math.abs(x - pathX(z)) < 5) continue;
+    trees.push({ x, y: heightAt(x, z), z, s, ry, pine: type, ci });
+  }
+  const pines = trees.filter(t => t.pine), leafs = trees.filter(t => !t.pine);
+  const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, Math.max(1, trees.length));
+  const pineM  = new THREE.InstancedMesh(pineGeo, pineMat, Math.max(1, pines.length));
+  const leafM  = new THREE.InstancedMesh(leafGeo, leafMat, Math.max(1, leafs.length));
+  trunks.count = trees.length; pineM.count = pines.length; leafM.count = leafs.length;
+  const place = (mesh, i, t, colors) => {
+    dummy.position.set(t.x, t.y, t.z);
+    dummy.rotation.set(0, t.ry, 0);
+    dummy.scale.setScalar(t.s);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    if (colors) mesh.setColorAt(i, colors[Math.floor(t.ci * colors.length)]);
+  };
+  trees.forEach((t, i) => place(trunks, i, t));
+  pines.forEach((t, i) => place(pineM, i, t, PINE_COLORS));
+  leafs.forEach((t, i) => place(leafM, i, t, LEAF_COLORS));
+  group.add(trunks, pineM, leafM);
+
+  scene.add(group);
+  return { group, terrain, insts: [trunks, pineM, leafM] };
+}
+
+function disposeChunk(c) {
+  scene.remove(c.group);
+  c.terrain.geometry.dispose();
+  c.insts.forEach(m => m.dispose());
+}
+
+let lastCX = null, lastCZ = null;
+function syncChunks() {
+  const cx = Math.floor(dolly.position.x / CHUNK);
+  const cz = Math.floor(dolly.position.z / CHUNK);
+  if (cx === lastCX && cz === lastCZ) return;
+  lastCX = cx; lastCZ = cz;
+  const need = new Set();
+  for (let dx = -RADIUS; dx <= RADIUS; dx++)
+    for (let dz = -RADIUS; dz <= RADIUS; dz++) {
+      const key = `${cx + dx},${cz + dz}`;
+      need.add(key);
+      if (!chunks.has(key)) chunks.set(key, buildChunk(cx + dx, cz + dz));
+    }
+  for (const [key, c] of chunks) {
+    if (!need.has(key)) { disposeChunk(c); chunks.delete(key); }
+  }
+}
+
+/* ========== 雲 ========== */
+const clouds = new THREE.Group();
+const cloudMat = new THREE.MeshLambertMaterial({ color: 0xd8cfd8, flatShading: true });
+const cr = mulberry32(seed + 999);
+for (let i = 0; i < 14; i++) {
+  const c = new THREE.Mesh(new THREE.IcosahedronGeometry(4 + cr() * 5, 0), cloudMat);
+  c.scale.set(1.8, 0.5, 1);
+  c.position.set((cr() - 0.5) * 300, 45 + cr() * 25, (cr() - 0.5) * 300);
+  clouds.add(c);
+}
+scene.add(clouds);
+
+/* ========== 入力 (PC確認用) ========== */
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'KeyH') { const p = document.getElementById('panel'); p.style.display = p.style.display === 'none' ? '' : 'none'; }
+  if (e.code === 'BracketLeft')  speedMult = Math.max(0.25, speedMult - 0.25);
+  if (e.code === 'BracketRight') speedMult = Math.min(4, speedMult + 0.25);
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+let dragging = false;
+renderer.domElement.addEventListener('pointerdown', () => { dragging = true; });
+addEventListener('pointerup', () => { dragging = false; });
+addEventListener('pointermove', e => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  camera.rotation.y -= e.movementX * 0.005;
+  camera.rotation.x = Math.max(-1.2, Math.min(1.2, camera.rotation.x - e.movementY * 0.005));
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ========== メインループ ========== */
+const clock = new THREE.Clock();
+const fwd = new THREE.Vector3();
+const statusEl = document.getElementById('status');
+let prevHeadY = null, bob = 0, statusTimer = 0;
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  let speed = 0;
+
+  if (renderer.xr.isPresenting) {
+    // 足踏み検出: 頭の上下方向の速さ(平滑化)が一定以上なら「歩いている」とみなす
+    const y = camera.position.y;
+    if (prevHeadY !== null && dt > 0) {
+      const vy = Math.abs((y - prevHeadY) / dt);
+      bob += (vy - bob) * (1 - Math.exp(-dt * 6));
+    }
+    prevHeadY = y;
+    speed = Math.min(MAX_SPEED, Math.max(0, bob - STEP_THRESHOLD) * STEP_GAIN);
+  } else {
+    prevHeadY = null; bob = 0;
+    if (keys['KeyW']) speed = 3;
+    if (keys['KeyS']) speed = -2;
+  }
+  speed *= speedMult;
+
+  if (speed !== 0) {
+    camera.getWorldDirection(fwd);
+    fwd.y = 0;
+    if (fwd.lengthSq() > 1e-6) {
+      fwd.normalize();
+      dolly.position.addScaledVector(fwd, speed * dt);
+    }
+  }
+
+  // 地形に高さを合わせる
+  const targetY = heightAt(dolly.position.x, dolly.position.z);
+  dolly.position.y += (targetY - dolly.position.y) * Math.min(1, dt * 8);
+
+  syncChunks();
+  clouds.position.set(dolly.position.x, 0, dolly.position.z);
+  clouds.rotation.y += dt * 0.005;
+
+  statusTimer += dt;
+  if (statusTimer > 0.3 && !renderer.xr.isPresenting) {
+    statusTimer = 0;
+    statusEl.textContent = `シード: ${seed} / 速度倍率: ×${speedMult.toFixed(2)}`;
+  }
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
