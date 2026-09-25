@@ -7,21 +7,29 @@
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #9a8aa8; font-family: sans-serif; }
   #panel {
-    position: fixed; top: 12px; left: 12px; max-width: 320px;
+    position: fixed; top: 12px; left: 12px; max-width: 330px;
     padding: 10px 14px; border-radius: 10px;
     background: rgba(40, 40, 50, 0.75); color: #eee; font-size: 12px; line-height: 1.6;
   }
   #panel b { font-size: 14px; }
   #panel kbd { background: #555; border-radius: 3px; padding: 0 4px; }
   #status { margin-top: 6px; color: #ffd9a0; }
+  #themes { margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; }
+  #themes button {
+    background: #55556a; color: #fff; border: 0; border-radius: 6px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  #themes button.active { background: #d9822b; }
 </style>
 </head>
 <body>
 <div id="panel">
   <b>Lowpoly Walk</b><br>
   Quest のブラウザで開いて「ENTER VR」。その場で足踏みすると、見ている方向へ進みます。<br>
-  PC確認: <kbd>W</kbd> 前進 / ドラッグで視点 / <kbd>[</kbd> <kbd>]</kbd> 速度 / <kbd>H</kbd> パネル表示<br>
-  シード変更: URL末尾に <kbd>?seed=7</kbd>
+  VR: <kbd>グリップ(握るボタン)</kbd> で季節・地形を切り替え<br>
+  PC確認: <kbd>W</kbd> 前進 / ドラッグで視点 / <kbd>T</kbd> テーマ切替 / <kbd>[</kbd> <kbd>]</kbd> 速度 / <kbd>H</kbd> パネル表示<br>
+  URL指定: <kbd>?theme=winter&amp;seed=7</kbd>
+  <div id="themes"></div>
   <div id="status"></div>
 </div>
 
@@ -37,6 +45,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* ========== 調整用パラメータ ========== */
 const STEP_THRESHOLD = 0.12;  // 足踏み判定のしきい値 (頭の上下速度 m/s)。小さいほど敏感
@@ -46,8 +55,65 @@ const CHUNK          = 40;    // 地形チャンクの大きさ (m)
 const SEG            = 20;    // チャンク分割数
 const RADIUS         = 2;     // プレイヤー周囲に読み込むチャンク数
 
+/* ========== テーマ(季節・地形)の定義 ========== */
+const THEMES = {
+  autumn: {
+    label: '秋', shape: 'tree',
+    sky: 0x9a8aa8, fog: [40, 105], hemi: [0xe8d8ff, 0x6b5a4a, 1.0], sun: [0xffd9a8, 1.6], cloud: 0xd8cfd8,
+    terrain: { freq: 0.012, amp: 30, off: 0.35, detail: 2 },
+    ground: { path: 0x8a6a55, low: 0x7a6f66, mid: 0x8a8060, high: 0xc9b7a5, h1: 5, h2: 11 },
+    trunk: 0x5a4030, trees: 16, pineRatio: 0.5,
+    pine: [0x2f4a3a, 0x36573f, 0x2a4234],
+    leaf: [0xd9822b, 0xc8501e, 0xe0a23a, 0xb3391f, 0xcf6a24],
+    particles: { color: 0xe07a2a, size: 0.18, fall: 1.0, drift: 1.2, count: 260 },
+  },
+  spring: {
+    label: '春', shape: 'tree',
+    sky: 0xbfe0f0, fog: [45, 115], hemi: [0xffffff, 0x9ab080, 1.1], sun: [0xfff2d0, 1.5], cloud: 0xffffff,
+    terrain: { freq: 0.011, amp: 24, off: 0.35, detail: 2 },
+    ground: { path: 0xb59a7a, low: 0x8db35c, mid: 0xa6c46e, high: 0xcfd9b0, h1: 5, h2: 10 },
+    trunk: 0x6a4a3a, trees: 16, pineRatio: 0.3,
+    pine: [0x4f8f4a, 0x5a9c50, 0x437f42],
+    leaf: [0xf4a6c0, 0xf7c1d3, 0xe98fb0, 0xffd6e2],
+    particles: { color: 0xffc2d6, size: 0.16, fall: 0.8, drift: 1.4, count: 260 },
+  },
+  summer: {
+    label: '夏', shape: 'tree',
+    sky: 0x6fb8e8, fog: [50, 125], hemi: [0xffffff, 0x6a8a4a, 1.1], sun: [0xfff4d6, 2.0], cloud: 0xffffff,
+    terrain: { freq: 0.012, amp: 26, off: 0.35, detail: 2 },
+    ground: { path: 0xa08060, low: 0x4f9a3f, mid: 0x5fae4a, high: 0x9a9a8a, h1: 6, h2: 12 },
+    trunk: 0x5a4030, trees: 18, pineRatio: 0.4,
+    pine: [0x1f5c33, 0x2a6e3c, 0x256a38],
+    leaf: [0x3f9a3a, 0x52b048, 0x2f8a3a, 0x63bd52],
+    particles: null,
+  },
+  winter: {
+    label: '冬', shape: 'tree',
+    sky: 0xb8c4d0, fog: [25, 90], hemi: [0xdde8f5, 0x8090a0, 1.1], sun: [0xdfe9ff, 1.2], cloud: 0xdfe6ec,
+    terrain: { freq: 0.010, amp: 42, off: 0.35, detail: 2 },
+    ground: { path: 0xaab2ba, low: 0xe8eef2, mid: 0xdde6ec, high: 0xf6f9fb, h1: 8, h2: 16 },
+    trunk: 0x4a3b34, trees: 14, pineRatio: 0.85,
+    pine: [0x9fb8b0, 0x87a39b, 0xc4d6d2],
+    leaf: [0xd9e2e8, 0xc4d0d8],
+    particles: { color: 0xffffff, size: 0.13, fall: 1.6, drift: 0.6, count: 400 },
+  },
+  desert: {
+    label: '砂漠', shape: 'desert',
+    sky: 0xf0c98a, fog: [40, 110], hemi: [0xfff0d0, 0xb08a50, 1.0], sun: [0xfff0c0, 2.0], cloud: 0xf5e6c8,
+    terrain: { freq: 0.008, amp: 16, off: 0.4, detail: 1 },
+    ground: { path: 0x9a7346, low: 0xd9b26f, mid: 0xe0bd7c, high: 0xc99a55, h1: 3, h2: 8 },
+    trunk: 0x5a4030, trees: 10, pineRatio: 0.6,
+    pine: [0x5d8a4a, 0x6f9a52],          // サボテン
+    leaf: [0xa8845a, 0x94724a, 0xb99870], // 岩
+    particles: null,
+  },
+};
+const THEME_KEYS = Object.keys(THEMES);
+
 const params = new URLSearchParams(location.search);
 const seed = parseInt(params.get('seed') ?? '42', 10) || 42;
+let themeKey = THEMES[params.get('theme')] ? params.get('theme') : 'autumn';
+let TH = THEMES[themeKey];
 let speedMult = 1;
 
 /* ========== 乱数・ノイズ (シード対応) ========== */
@@ -83,20 +149,21 @@ function fbm(x, z, oct = 4) {
 }
 const smoothstep = (a, b, x) => smooth(Math.min(1, Math.max(0, (x - a) / (b - a))));
 
-/* ========== 地形の高さ関数 ========== */
+/* ========== 地形の高さ関数 (テーマごとに起伏が変わる) ========== */
 const pathX = z => Math.sin(z * 0.02 + seed) * 15 + Math.sin(z * 0.005 + seed * 0.3) * 30;
 function heightAt(x, z) {
-  const hill = (fbm(x * 0.012, z * 0.012) - 0.35) * 30 + fbm(x * 0.06, z * 0.06, 2) * 2;
+  const T = TH.terrain;
+  const hill = (fbm(x * T.freq, z * T.freq) - T.off) * T.amp + fbm(x * 0.06, z * 0.06, 2) * T.detail;
   const pathH = fbm(z * 0.01 + 100, 7.7, 3) * 6;
   const t = smoothstep(2.5, 9, Math.abs(x - pathX(z)));
   return lerp(pathH, hill, t);
 }
 
 /* ========== シーン ========== */
-const SKY = new THREE.Color(0x9a8aa8);
+const SKY = new THREE.Color(TH.sky);
 const scene = new THREE.Scene();
 scene.background = SKY;
-scene.fog = new THREE.Fog(SKY, 40, 105);
+scene.fog = new THREE.Fog(SKY, TH.fog[0], TH.fog[1]);
 
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 300);
 camera.rotation.order = 'YXZ';
@@ -106,8 +173,9 @@ scene.add(dolly);
 camera.position.set(0, 1.6, 0);
 dolly.position.set(pathX(0), heightAt(pathX(0), 0), 0);  // 道の上からスタート
 
-scene.add(new THREE.HemisphereLight(0xe8d8ff, 0x6b5a4a, 1.0));
-const sun = new THREE.DirectionalLight(0xffd9a8, 1.6);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x888888, 1.0);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
 sun.position.set(-60, 80, -40);
 scene.add(sun);
 
@@ -123,22 +191,33 @@ document.body.appendChild(VRButton.createButton(renderer));
 const trunkGeo = new THREE.CylinderGeometry(0.25, 0.35, 2, 5).translate(0, 1, 0);
 const pineGeo  = new THREE.ConeGeometry(1.6, 5, 6).translate(0, 4.2, 0);
 const leafGeo  = new THREE.IcosahedronGeometry(2.1, 0).translate(0, 3.9, 0);
+const rockGeo  = new THREE.IcosahedronGeometry(1.5, 0).scale(1.3, 0.7, 1).translate(0, 0.5, 0);
+const cactusGeo = (() => {
+  const cyl = (r1, r2, h) => new THREE.CylinderGeometry(r1, r2, h, 6);
+  return mergeGeometries([
+    cyl(0.4, 0.5, 4.5).translate(0, 2.25, 0),
+    cyl(0.22, 0.25, 1.4).rotateZ(Math.PI / 2).translate(-0.9, 2.6, 0),
+    cyl(0.2, 0.22, 1.3).translate(-1.55, 3.2, 0),
+    cyl(0.22, 0.25, 1.4).rotateZ(Math.PI / 2).translate(0.9, 1.8, 0),
+    cyl(0.2, 0.22, 1.3).translate(1.55, 2.4, 0),
+  ]);
+})();
 const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5a4030, flatShading: true });
 const pineMat  = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true });
 const leafMat  = new THREE.MeshLambertMaterial({ color: 0xffffff, flatShading: true });
 const terrainMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
 
-const PINE_COLORS = [0x2f4a3a, 0x36573f, 0x2a4234].map(c => new THREE.Color(c));
-const LEAF_COLORS = [0xd9822b, 0xc8501e, 0xe0a23a, 0xb3391f, 0xcf6a24].map(c => new THREE.Color(c));
-
 /* ========== チャンク生成 ========== */
 const chunks = new Map();
 const dummy = new THREE.Object3D();
 const tmpColor = new THREE.Color();
+const cHigh = new THREE.Color(), cMid = new THREE.Color(), cLow = new THREE.Color();
 
 function buildChunk(cx, cz) {
   const group = new THREE.Group();
   const ox = cx * CHUNK, oz = cz * CHUNK;
+  const G = TH.ground;
+  cHigh.set(G.high); cMid.set(G.mid); cLow.set(G.low);
 
   // --- 地形 ---
   let geo = new THREE.PlaneGeometry(CHUNK, CHUNK, SEG, SEG);
@@ -157,10 +236,10 @@ function buildChunk(cx, cz) {
     const czm = (pos.getZ(i) + pos.getZ(i + 1) + pos.getZ(i + 2)) / 3 + oz;
     const hm  = (pos.getY(i) + pos.getY(i + 1) + pos.getY(i + 2)) / 3;
     const d = Math.abs(cxm - pathX(czm));
-    if (d < 3.5) tmpColor.set(0x8a6a55);
-    else if (hm > 11) tmpColor.set(0xc9b7a5);
-    else if (hm > 5) tmpColor.set(0x8a8060).lerp(new THREE.Color(0xc9b7a5), (hm - 5) / 6);
-    else tmpColor.set(0x7a6f66).lerp(new THREE.Color(0x8a8060), Math.max(0, hm / 5));
+    if (d < 3.5) tmpColor.set(G.path);
+    else if (hm > G.h2) tmpColor.copy(cHigh);
+    else if (hm > G.h1) tmpColor.copy(cMid).lerp(cHigh, (hm - G.h1) / (G.h2 - G.h1));
+    else tmpColor.copy(cLow).lerp(cMid, Math.max(0, hm / G.h1));
     tmpColor.multiplyScalar(0.9 + hash2(Math.floor(cxm * 3), Math.floor(czm * 3)) * 0.2);
     for (let k = 0; k < 3; k++) tmpColor.toArray(colors, (i + k) * 3);
   }
@@ -170,31 +249,35 @@ function buildChunk(cx, cz) {
   terrain.position.set(ox + CHUNK / 2, 0, oz + CHUNK / 2);
   group.add(terrain);
 
-  // --- 木 (InstancedMesh で描画負荷を抑える) ---
+  // --- 木・サボテン・岩 (InstancedMesh で描画負荷を抑える) ---
+  const desert = TH.shape === 'desert';
+  const pineColors = TH.pine.map(c => new THREE.Color(c));
+  const leafColors = TH.leaf.map(c => new THREE.Color(c));
   const rng = mulberry32(Math.imul(cx, 73856093) ^ Math.imul(cz, 19349663) ^ seed);
   const trees = [];
-  for (let n = 0; n < 16; n++) {
+  for (let n = 0; n < TH.trees; n++) {
     const x = ox + rng() * CHUNK, z = oz + rng() * CHUNK;
-    const s = 0.8 + rng() * 0.9, ry = rng() * Math.PI * 2, type = rng() < 0.5, ci = rng();
+    const s = 0.8 + rng() * 0.9, ry = rng() * Math.PI * 2, type = rng() < TH.pineRatio, ci = rng();
     if (Math.abs(x - pathX(z)) < 5) continue;
     trees.push({ x, y: heightAt(x, z), z, s, ry, pine: type, ci });
   }
   const pines = trees.filter(t => t.pine), leafs = trees.filter(t => !t.pine);
   const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, Math.max(1, trees.length));
-  const pineM  = new THREE.InstancedMesh(pineGeo, pineMat, Math.max(1, pines.length));
-  const leafM  = new THREE.InstancedMesh(leafGeo, leafMat, Math.max(1, leafs.length));
-  trunks.count = trees.length; pineM.count = pines.length; leafM.count = leafs.length;
-  const place = (mesh, i, t, colors) => {
+  const pineM  = new THREE.InstancedMesh(desert ? cactusGeo : pineGeo, pineMat, Math.max(1, pines.length));
+  const leafM  = new THREE.InstancedMesh(desert ? rockGeo : leafGeo, leafMat, Math.max(1, leafs.length));
+  trunks.count = desert ? 0 : trees.length;
+  pineM.count = pines.length; leafM.count = leafs.length;
+  const place = (mesh, i, t, cols) => {
     dummy.position.set(t.x, t.y, t.z);
     dummy.rotation.set(0, t.ry, 0);
     dummy.scale.setScalar(t.s);
     dummy.updateMatrix();
     mesh.setMatrixAt(i, dummy.matrix);
-    if (colors) mesh.setColorAt(i, colors[Math.floor(t.ci * colors.length)]);
+    if (cols) mesh.setColorAt(i, cols[Math.floor(t.ci * cols.length)]);
   };
-  trees.forEach((t, i) => place(trunks, i, t));
-  pines.forEach((t, i) => place(pineM, i, t, PINE_COLORS));
-  leafs.forEach((t, i) => place(leafM, i, t, LEAF_COLORS));
+  if (!desert) trees.forEach((t, i) => place(trunks, i, t));
+  pines.forEach((t, i) => place(pineM, i, t, pineColors));
+  leafs.forEach((t, i) => place(leafM, i, t, leafColors));
   group.add(trunks, pineM, leafM);
 
   scene.add(group);
@@ -237,13 +320,101 @@ for (let i = 0; i < 14; i++) {
 }
 scene.add(clouds);
 
+/* ========== 舞う粒子 (落ち葉・花びら・雪) ========== */
+const P_MAX = 400;
+const pPos = new Float32Array(P_MAX * 3);
+const pGeo = new THREE.BufferGeometry();
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+const pMat = new THREE.PointsMaterial({ size: 0.15, transparent: true, opacity: 0.9, depthWrite: false });
+const points = new THREE.Points(pGeo, pMat);
+points.frustumCulled = false;
+scene.add(points);
+
+function resetParticles() {
+  const pr = mulberry32(seed + 7);
+  for (let i = 0; i < P_MAX; i++) {
+    pPos[i * 3]     = dolly.position.x + (pr() - 0.5) * 50;
+    pPos[i * 3 + 1] = dolly.position.y + pr() * 20 - 2;
+    pPos[i * 3 + 2] = dolly.position.z + (pr() - 0.5) * 50;
+  }
+  pGeo.attributes.position.needsUpdate = true;
+}
+function updateParticles(dt, time) {
+  const P = TH.particles;
+  if (!P) return;
+  const px = dolly.position.x, py = dolly.position.y, pz = dolly.position.z;
+  for (let i = 0; i < P.count; i++) {
+    let x = pPos[i * 3], y = pPos[i * 3 + 1], z = pPos[i * 3 + 2];
+    y -= P.fall * dt;
+    x += Math.sin(time * 0.8 + i) * P.drift * dt;
+    z += Math.cos(time * 0.6 + i * 1.7) * P.drift * 0.6 * dt;
+    if (y < py - 2) y += 22;
+    if (x - px > 25) x -= 50; else if (x - px < -25) x += 50;
+    if (z - pz > 25) z -= 50; else if (z - pz < -25) z += 50;
+    pPos[i * 3] = x; pPos[i * 3 + 1] = y; pPos[i * 3 + 2] = z;
+  }
+  pGeo.attributes.position.needsUpdate = true;
+}
+
+/* ========== テーマ切り替え ========== */
+const statusEl = document.getElementById('status');
+const themesEl = document.getElementById('themes');
+THEME_KEYS.forEach(k => {
+  const b = document.createElement('button');
+  b.textContent = THEMES[k].label;
+  b.dataset.key = k;
+  b.addEventListener('click', () => applyTheme(k));
+  themesEl.appendChild(b);
+});
+
+function applyTheme(key) {
+  themeKey = key; TH = THEMES[key];
+  SKY.set(TH.sky);
+  scene.fog.color.set(TH.sky); scene.fog.near = TH.fog[0]; scene.fog.far = TH.fog[1];
+  hemi.color.set(TH.hemi[0]); hemi.groundColor.set(TH.hemi[1]); hemi.intensity = TH.hemi[2];
+  sun.color.set(TH.sun[0]); sun.intensity = TH.sun[1];
+  cloudMat.color.set(TH.cloud);
+  trunkMat.color.set(TH.trunk);
+
+  // 地形と木を作り直す
+  for (const c of chunks.values()) disposeChunk(c);
+  chunks.clear();
+  lastCX = lastCZ = null;
+  dolly.position.y = heightAt(dolly.position.x, dolly.position.z);
+
+  // 粒子
+  if (TH.particles) {
+    pMat.color.set(TH.particles.color);
+    pMat.size = TH.particles.size;
+    pGeo.setDrawRange(0, TH.particles.count);
+    resetParticles();
+  }
+  points.visible = !!TH.particles;
+
+  themesEl.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.key === key));
+  const url = new URL(location.href);
+  url.searchParams.set('theme', key);
+  history.replaceState(null, '', url);
+}
+const nextTheme = () => applyTheme(THEME_KEYS[(THEME_KEYS.indexOf(themeKey) + 1) % THEME_KEYS.length]);
+
+// VR: コントローラーのグリップ(握るボタン)でテーマ切り替え
+for (let i = 0; i < 2; i++) {
+  const ctrl = renderer.xr.getController(i);
+  ctrl.addEventListener('squeezestart', nextTheme);
+  dolly.add(ctrl);
+}
+
 /* ========== 入力 (PC確認用) ========== */
 const keys = {};
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'KeyH') { const p = document.getElementById('panel'); p.style.display = p.style.display === 'none' ? '' : 'none'; }
+  if (e.code === 'KeyT') nextTheme();
   if (e.code === 'BracketLeft')  speedMult = Math.max(0.25, speedMult - 0.25);
   if (e.code === 'BracketRight') speedMult = Math.min(4, speedMult + 0.25);
+  const m = /^Digit([1-9])$/.exec(e.code);
+  if (m && THEME_KEYS[+m[1] - 1]) applyTheme(THEME_KEYS[+m[1] - 1]);
 });
 addEventListener('keyup', e => { keys[e.code] = false; });
 let dragging = false;
@@ -263,11 +434,13 @@ addEventListener('resize', () => {
 /* ========== メインループ ========== */
 const clock = new THREE.Clock();
 const fwd = new THREE.Vector3();
-const statusEl = document.getElementById('status');
-let prevHeadY = null, bob = 0, statusTimer = 0;
+let prevHeadY = null, bob = 0, statusTimer = 0, elapsed = 0;
+
+applyTheme(themeKey);
 
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
+  elapsed += dt;
   let speed = 0;
 
   if (renderer.xr.isPresenting) {
@@ -300,13 +473,14 @@ renderer.setAnimationLoop(() => {
   dolly.position.y += (targetY - dolly.position.y) * Math.min(1, dt * 8);
 
   syncChunks();
+  updateParticles(dt, elapsed);
   clouds.position.set(dolly.position.x, 0, dolly.position.z);
   clouds.rotation.y += dt * 0.005;
 
   statusTimer += dt;
   if (statusTimer > 0.3 && !renderer.xr.isPresenting) {
     statusTimer = 0;
-    statusEl.textContent = `シード: ${seed} / 速度倍率: ×${speedMult.toFixed(2)}`;
+    statusEl.textContent = `テーマ: ${TH.label} / シード: ${seed} / 速度倍率: ×${speedMult.toFixed(2)}`;
   }
 
   renderer.render(scene, camera);
