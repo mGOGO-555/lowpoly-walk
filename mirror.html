@@ -1046,6 +1046,39 @@ function fabrik(P, l, target) {                          // P[0]を固定し、P
     if (P[n].distanceToSquared(target) < 1e-8) break;
   }
 }
+const _bc = { u0: new THREE.Vector3(), u1: new THREE.Vector3(), c: new THREE.Vector3(), ax: new THREE.Vector3(), vt: new THREE.Vector3(), vg: new THREE.Vector3(), cr: new THREE.Vector3() };
+const _bq = new THREE.Quaternion();
+const FINGER_LIMITS = [[-0.35, 1.5], [0, 1.9], [0, 1.4]];   // 指: MP・PIP・DIP関節の屈曲角の範囲 (rad)。マイナスは過伸展 (PIP・DIPは過伸展させない)
+const THUMB_LIMITS = [[0, 1.0], [0, 1.1], [0, 1.3]];        // 親指: CMC・MP・IP関節
+// 指先をtargetへ寄せる。各関節を「その関節が曲がる軸」まわりにだけ回し(CCD)、関節ごとの可動範囲を守る → ねじれ・過伸展が起きない
+// P: 鏡像側(手の座標)の関節位置 [基部(固定), 第1関節, 第2関節, 第3関節, 指先]。palmN: 手のひら側の法線
+function bendChain(P, isThumb, palmN, target) {
+  const n = P.length - 1, lim = isThumb ? THUMB_LIMITS : FINGER_LIMITS;
+  const { u0, u1, c, ax, vt, vg, cr } = _bc;
+  for (let sweep = 0; sweep < 8; sweep++) {
+    for (let k = n - 1; k >= 1; k--) {
+      u0.subVectors(P[k], P[k - 1]).normalize();
+      u1.subVectors(P[k + 1], P[k]).normalize();
+      c.crossVectors(u0, u1);
+      let planar = false;
+      if (palmN) { ax.crossVectors(u0, palmN); if (ax.lengthSq() > 1e-8) { ax.normalize(); planar = true; } }   // 指: 屈曲軸 = 骨の向き × 手のひらの法線
+      if ((!planar || isThumb) && c.length() > 0.05) ax.copy(c).normalize();                                     // 親指: 現在の曲がりの面の軸
+      else if (!planar) continue;
+      const beta = Math.atan2(ax.dot(c), u0.dot(u1));                    // 現在の屈曲角 (屈曲が正)
+      vt.subVectors(P[n], P[k]); vg.subVectors(target, P[k]);
+      vt.addScaledVector(ax, -vt.dot(ax)); vg.addScaledVector(ax, -vg.dot(ax));   // 屈曲面に投影
+      if (vt.lengthSq() < 1e-10 || vg.lengthSq() < 1e-10) continue;
+      cr.crossVectors(vt, vg);
+      let phi = Math.atan2(ax.dot(cr), vt.dot(vg));
+      const lo = Math.min(lim[k - 1][0], beta) - beta, hi = Math.max(lim[k - 1][1], beta) - beta;   // 可動範囲 (すでに範囲外の関節は無理に戻さない)
+      phi = Math.max(lo, Math.min(hi, phi));
+      if (Math.abs(phi) < 1e-5) continue;
+      _bq.setFromAxisAngle(ax, phi);
+      for (let j = k + 1; j <= n; j++) P[j].sub(P[k]).applyQuaternion(_bq).add(P[k]);
+    }
+    if (P[n].distanceToSquared(target) < 1e-6) break;
+  }
+}
 function applyGripPose(dt) {
   grip.k += ((grab.active ? 1 : 0) - grip.k) * (1 - Math.exp(-dt / 0.08));   // つかむ/離すときになめらかに移行
   const pinching = grab.active || grip.k > 0.01;
@@ -1065,10 +1098,11 @@ function applyGripPose(dt) {
   _ad.applyQuaternion(_cqi);
   const ax = Math.abs(_ad.x), ay = Math.abs(_ad.y), az = Math.abs(_ad.z);
   const axis = (ax >= ay && ax >= az) ? 0 : (ay >= az ? 1 : 2);
-  const sgn = _ad.getComponent(axis) < 0 ? -1 : 1;       // 親指側の面の向き
+  const sgn = _ad.getComponent(axis) < 0 ? -1 : 1;
+  const palmN = computeLeftHandFrame(_hq) ? _fy.clone() : null;   // 手のひら側の法線 (鏡像側の座標。指の屈曲軸を決めるのに使う)       // 親指側の面の向き
 
   for (const ch of FINGER_CHAINS) {
-    const names = ch.thumb ? ch.names : ch.names.slice(1);   // 指は手のひらの中の中手骨を固定し、指の付け根(MP関節)から先を曲げ直す
+    const names = ch.thumb ? ['wrist', ...ch.names] : ch.names;   // 基部(手首/中手骨)を固定し、その先の関節を曲げ直す
     const objs = names.map(n => useModel ? J[n] : mirrored.leftHandJoints[jn(n)]);
     if (objs.some(o => !o || !(useModel ? o.visible : o.generated))) continue;
     const role = ch.thumb ? 'thumb' : (pinch.active[ch.fi] ? 'oppose' : 'other');
@@ -1093,7 +1127,7 @@ function applyGripPose(dt) {
     tgt.lerpVectors(cur, tgt, kk);
     env.cube.localToWorld(tgt);
 
-    fabrik(P, l, tgt);
+    bendChain(P, ch.thumb, palmN, tgt);
 
     const newReal = P.map(v => { const w = new THREE.Vector3(); if (useModel) mirrorPoint(v, w); else w.copy(v); return w; });
     for (let i = 0; i <= n; i++) {
