@@ -40,6 +40,8 @@ const CONFIG = {
   shoulderWidth: num('sw', 0.36),                    // 左右の肩の間隔
   headToShoulderVerticalOffset: num('vo', 0.22),     // 頭(両眼中間)から肩までの下方向の距離
   headToShoulderPosteriorOffset: num('po', 0.08),    // 頭から肩までの後方向の距離
+  headToNeckDown: num('hd', 0.08),                   // 頭(両眼中間)から首の回転軸までの下方向 (仮置き)
+  headToNeckBack: num('hb', 0.09),                   // 頭(両眼中間)から首の回転軸までの後方向 (仮置き)
   upperArmLength: num('ua', 0.30),
   forearmLength: num('fa', 0.27),                    // 肘〜手首
   // --- 肘の曲がる向き (身体座標: 右+, 上+, 前+)。外側・下・やや後方 ---
@@ -149,7 +151,7 @@ const body = {
   up: new THREE.Vector3(0, 1, 0),
   shoulderCenter: new THREE.Vector3(),   // ESTIMATED
 };
-const _f = new THREE.Vector3(), _u = new THREE.Vector3();
+const _f = new THREE.Vector3(), _u = new THREE.Vector3(), _neck = new THREE.Vector3();
 const wrapPi = a => Math.atan2(Math.sin(a), Math.cos(a));
 function updateBody(dt) {
   if (!tracked.headPoseValid) { body.valid = false; return; }
@@ -172,9 +174,11 @@ function updateBody(dt) {
   body.forward.set(Math.sin(body.yaw), 0, -Math.cos(body.yaw));
   body.up.set(0, 1, 0);
   body.right.crossVectors(body.forward, body.up).normalize();
-  body.shoulderCenter.copy(tracked.headPosition)
-    .addScaledVector(body.forward, -CONFIG.headToShoulderPosteriorOffset)
-    .addScaledVector(body.up, -CONFIG.headToShoulderVerticalOffset);
+  // 首の回転軸(推定)を頭の姿勢から求め、そこから肩の中央を決める → 首を振っても肩(=正中面)が動かない
+  _neck.set(0, -CONFIG.headToNeckDown, CONFIG.headToNeckBack).applyQuaternion(tracked.headQuaternion).add(tracked.headPosition);
+  body.shoulderCenter.copy(_neck)
+    .addScaledVector(body.up, -(CONFIG.headToShoulderVerticalOffset - CONFIG.headToNeckDown))
+    .addScaledVector(body.forward, -(CONFIG.headToShoulderPosteriorOffset - CONFIG.headToNeckBack));
   body.valid = body.shoulderCenter.toArray().every(Number.isFinite);
 }
 
