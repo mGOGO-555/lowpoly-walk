@@ -528,15 +528,16 @@ function debugLines() {
     `Pinch: ${pinch.on ? 'ON' : 'OFF'}`,
     `Pinch distance: ${Number.isFinite(pinch.distance) ? mm(pinch.distance) + ' mm' : '--'}`,
     `Cube grabbed: ${grab.active ? 'YES' : 'NO'}`,
+    `Hand model: ${realistic.ready ? 'MESH (Meta)' : 'SIMPLE (fallback)'}`,
   ];
 }
 const hudCanvas = document.createElement('canvas');
-hudCanvas.width = 512; hudCanvas.height = 424;
+hudCanvas.width = 512; hudCanvas.height = 458;
 const hudG = hudCanvas.getContext('2d');
 const hudTex = new THREE.CanvasTexture(hudCanvas);
 hudTex.colorSpace = THREE.SRGBColorSpace;
 const hudMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(0.4, 0.331),
+  new THREE.PlaneGeometry(0.4, 0.358),
   new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false })
 );
 hudMesh.position.set(-0.3, -0.25, -0.9);
@@ -551,9 +552,9 @@ function updateDebug(dt) {
   hudT = 0;
   const lines = debugLines();
   panelEl.textContent = 'Mirror Arm - Phase 4\n' + lines.join('\n');
-  hudG.clearRect(0, 0, 512, 424);
+  hudG.clearRect(0, 0, 512, 458);
   hudG.fillStyle = 'rgba(0,0,0,0.6)';
-  hudG.fillRect(0, 0, 512, 424);
+  hudG.fillRect(0, 0, 512, 458);
   hudG.font = 'bold 26px sans-serif';
   hudG.textBaseline = 'middle';
   lines.forEach((t, i) => {
@@ -878,41 +879,87 @@ function updateRestArm(dt) {
 }
 
 /* ==========================================================
-   GripClearance: cubeをつかんでいる間、親指と人差し指の先の間隔を cubeSize + gripPadding 以上に保って表示する
-   (実際の指は何も無い空間でつまむので、そのままだと表示の指がcubeにめり込む)。
-   表示専用: pinch判定・仮想pinch点は実測の関節位置のまま。
+   HandCubeCollision: 表示している手(仮想左手)の全ての指の関節が、cubeにめり込まないよう表示用の関節位置を補正する。
+   - つまんでいる間: 親指の関節は「つまむ軸」の親指側の面へ、人差し指の関節は反対側の面へ押し出す
+   - それ以外(他の指や、つまむ前): 最も浅く出られる面へ押し出す
+   表示専用: pinch判定・仮想pinch点・把持位置は実測の関節位置のまま。
    ========================================================== */
-const THUMB_CHAIN = { names: ['thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip'], w: [0, 0.3, 0.65, 1] };
-const INDEX_CHAIN = { names: ['index-finger-metacarpal', 'index-finger-phalanx-proximal', 'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip'], w: [0, 0.15, 0.5, 0.8, 1] };
+const FINGER_CHAINS = [
+  { thumb: true, names: ['thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip'] },
+  ...['index-finger', 'middle-finger', 'ring-finger', 'pinky-finger'].map(f => ({
+    index: f === 'index-finger',
+    names: [`${f}-metacarpal`, `${f}-phalanx-proximal`, `${f}-phalanx-intermediate`, `${f}-phalanx-distal`, `${f}-tip`],
+  })),
+];
 const grip = { k: 0 };
-const _gu = new THREE.Vector3(), _q1 = new THREE.Quaternion();
+const _q1 = new THREE.Quaternion();
 const _pa = new THREE.Vector3(), _ca = new THREE.Vector3(), _cb = new THREE.Vector3(), _aq = new THREE.Quaternion();
-function shiftChain(J, chain, vec) {                   // 先端をvecだけ、根元側ほど小さくずらし、骨の向きも新しい方向へ回す
-  const objs = chain.names.map(n => J[n]);
-  if (objs.some(o => !o || !o.visible)) return;
-  const oldP = objs.map(o => o.position.clone());
-  const newP = oldP.map((p, i) => p.clone().addScaledVector(vec, chain.w[i]));
-  for (let i = 0; i < objs.length; i++) {
-    const j = Math.min(i, objs.length - 2);             // 先端は直前の骨と同じ回転
-    const a0 = oldP[j + 1].clone().sub(oldP[j]), a1 = newP[j + 1].clone().sub(newP[j]);
-    if (a0.lengthSq() > 1e-10 && a1.lengthSq() > 1e-10) { _q1.setFromUnitVectors(a0.normalize(), a1.normalize()); objs[i].quaternion.premultiply(_q1); }
-    objs[i].position.copy(newP[i]);
-  }
+const _cqi = new THREE.Quaternion(), _ad = new THREE.Vector3(), _lp = new THREE.Vector3(), _lo = new THREE.Vector3(), _lb = new THREE.Vector3();
+function resolveInCube(q, r, h, dirAxis, dirSign) {       // q: cubeローカル座標 (直接書き換える)
+  const e = h + r;
+  if (Math.abs(q.x) >= e || Math.abs(q.y) >= e || Math.abs(q.z) >= e) return;   // cubeの外
+  if (dirAxis >= 0) { q.setComponent(dirAxis, dirSign * e); return; }
+  const px = e - Math.abs(q.x), py = e - Math.abs(q.y), pz = e - Math.abs(q.z);
+  if (px <= py && px <= pz) q.x = (q.x < 0 ? -1 : 1) * e;
+  else if (py <= pz) q.y = (q.y < 0 ? -1 : 1) * e;
+  else q.z = (q.z < 0 ? -1 : 1) * e;
 }
-function applyGripClearance(dt) {
-  grip.k += ((grab.active ? 1 : 0) - grip.k) * (1 - Math.exp(-dt / 0.08));   // つかむ/離すときになめらかに開閉
-  if (grip.k < 0.01 || !realistic.ready) return;
-  const e = realistic.entries.find(en => en.h.userData.handedness === 'right');
-  if (!e || !e.h.joints) return;
-  const J = e.h.joints, t = J['thumb-tip'], ix = J['index-finger-tip'];
-  if (!t || !ix || !t.visible || !ix.visible) return;
-  _gu.subVectors(t.position, ix.position);
-  const dist = _gu.length(), gap = CONFIG.cubeSize + CONFIG.gripPadding;
-  if (dist < 1e-6 || dist >= gap) return;
-  _gu.divideScalar(dist);
-  const half = (gap - dist) * 0.5 * grip.k;
-  shiftChain(J, THUMB_CHAIN, _gu.clone().multiplyScalar(half));
-  shiftChain(J, INDEX_CHAIN, _gu.clone().multiplyScalar(-half));
+function applyHandCubeCollision(dt) {
+  grip.k += ((grab.active ? 1 : 0) - grip.k) * (1 - Math.exp(-dt / 0.08));   // つかむ/離すときになめらかに移行
+  if (!env.anchored || !body.valid || !mirrored.valid) return;
+  const useModel = realistic.ready;                        // 手モデル使用時は実右手の関節(反射前)を、簡易表示時は反転済みの関節を補正する
+  let J = null;
+  if (useModel) {
+    const en = realistic.entries.find(x => x.h.userData.handedness === 'right');
+    if (!en || !en.h.joints) return;
+    J = en.h.joints;
+  }
+  env.cube.updateWorldMatrix(true, false);
+  const h = CONFIG.cubeSize / 2;
+  const pinching = grab.active || grip.k > 0.01;
+  let axis = -1, sgn = 1;
+  if (pinching) {                                          // つまむ軸(親指先-人差し指先)に最も近いcubeの軸
+    const L = mirrored.leftHandJoints;
+    if (L[IDX_THUMB_TIP].generated && L[IDX_INDEX_TIP].generated) {
+      _ad.subVectors(L[IDX_THUMB_TIP].position, L[IDX_INDEX_TIP].position);
+      env.cube.getWorldQuaternion(_cqi).invert();
+      _ad.applyQuaternion(_cqi);
+      const ax = Math.abs(_ad.x), ay = Math.abs(_ad.y), az = Math.abs(_ad.z);
+      axis = (ax >= ay && ax >= az) ? 0 : (ay >= az ? 1 : 2);
+      sgn = _ad.getComponent(axis) < 0 ? -1 : 1;
+    }
+  }
+  const kk = pinching ? grip.k : 1;
+  for (const ch of FINGER_CHAINS) {
+    const objs = ch.names.map(n => useModel ? J[n] : mirrored.leftHandJoints[jn(n)]);
+    if (objs.some(o => !o || !(useModel ? o.visible : o.generated))) continue;
+    const oldP = objs.map(o => o.position.clone());
+    let changed = false;
+    const newP = oldP.map((p, i) => {
+      const isTip = i === objs.length - 1;
+      const r = isTip ? 0.003 : Math.max(useModel ? (objs[i].jointRadius || 0) : 0, 0.006) + 0.003;   // 指先は皮膚が接する程度、他は関節の太さ分
+      if (useModel) mirrorPoint(p, _lp); else _lp.copy(p);  // cubeがある側(鏡像側)の座標にそろえる
+      env.cube.worldToLocal(_lp);
+      _lb.copy(_lp);
+      const dirAxis = (pinching && axis >= 0 && (ch.thumb || ch.index)) ? axis : -1;
+      resolveInCube(_lp, r, h, dirAxis, ch.thumb ? sgn : -sgn);
+      if (_lp.distanceToSquared(_lb) < 1e-12) return p.clone();
+      changed = true;
+      _lp.lerpVectors(_lb, _lp, kk);
+      env.cube.localToWorld(_lp);
+      if (useModel) { _lo.copy(_lp); mirrorPoint(_lo, _lp); }   // 鏡像側 → 実右手側へ戻す
+      return _lp.clone();
+    });
+    if (!changed) continue;
+    for (let i = 0; i < objs.length; i++) {
+      if (useModel) {                                      // 骨の向きも、新しい関節位置の方向へ回す
+        const j = Math.min(i, objs.length - 2);
+        const a0 = oldP[j + 1].clone().sub(oldP[j]), a1 = newP[j + 1].clone().sub(newP[j]);
+        if (a0.lengthSq() > 1e-10 && a1.lengthSq() > 1e-10) { _q1.setFromUnitVectors(a0.normalize(), a1.normalize()); objs[i].quaternion.premultiply(_q1); }
+      }
+      objs[i].position.copy(newP[i]);
+    }
+  }
 }
 function alignCubeToPinchAxis() {                      // つかむ瞬間、cubeの面が親指-人差し指の方向に垂直になるよう姿勢を補正
   const L = mirrored.leftHandJoints;
@@ -961,7 +1008,7 @@ renderer.setAnimationLoop((time, frame) => {
   updatePinch();
   updateVirtualPinchPoint();
   updateGrab(dt);
-  applyGripClearance(dt);
+  applyHandCubeCollision(dt);
   if (prevRightTracking && !tracked.rightHandTracking) logEvent('tracking_loss');
   prevRightTracking = tracked.rightHandTracking;
   renderPinchMarker();
