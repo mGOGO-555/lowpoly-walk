@@ -52,10 +52,18 @@ const CONFIG = {
   ikBendSmoothingSec: 0.05,                          // 肘の向きの連続性 (急な切り替え防止)
   // --- 表示色 ---
   colorTracked: 0x4fc3f7,     // TRACKED = 青
-  colorTrackedBone: 0x9ad8ff,
+  colorTrackedBone: 0x2a8fc8,
   colorEstimated: 0xffa040,   // ESTIMATED = オレンジ
   colorMirrored: 0x66dd77,    // MIRRORED / GENERATED = 緑
-  colorMirroredBone: 0xb5f0bd,
+  colorMirroredBone: 0x3aa64a,
+  // --- 環境 (Phase 2): セッション開始時の身体の前方に配置 ---
+  deskForward: num('dd', 0.45),                      // 肩の中央から机の中心までの前方距離
+  deskTopBelowShoulder: num('dh', 0.30),             // 机の上面は肩よりこの分だけ下
+  deskWidth: 1.0, deskDepth: 0.5, deskThickness: 0.04,
+  cubeSize: 0.05,                                    // cubeの一辺 (m)
+  cubeLocalX: -0.18,                                 // 机中心から左方向 (仮想左手の側)
+  cubeLocalZ: 0.07,                                  // 机中心より手前
+  colorCube: 0xe53935,
 };
 
 /* ========== WebXR Hand Input の25関節 ========== */
@@ -289,12 +297,18 @@ function updateMirror() {
 
 /* ========== シーン ========== */
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x202428);
+scene.background = new THREE.Color(0xffffff);
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 50);
 camera.position.set(0, 1.6, 0);
 scene.add(camera);
-scene.add(new THREE.GridHelper(4, 16, 0x556677, 0x334455));
-scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 2));
+{  // 床: 白〜薄いグレー
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(8, 8).rotateX(-Math.PI / 2), new THREE.MeshLambertMaterial({ color: 0xececec }));
+  scene.add(floor);
+}
+scene.add(new THREE.HemisphereLight(0xffffff, 0x999999, 2));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(0.5, 2, 0.8);
+scene.add(dirLight);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -456,6 +470,46 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
+/* ========== SceneSetup (Phase 2): 机とcube。セッション開始時の身体前方に一度だけ固定 ========== */
+const env = { anchored: false, group: new THREE.Group(), legs: [], cube: null };
+{
+  const wood = new THREE.MeshLambertMaterial({ color: 0xbfa27a });
+  const top = new THREE.Mesh(new THREE.BoxGeometry(CONFIG.deskWidth, CONFIG.deskThickness, CONFIG.deskDepth), wood);
+  top.position.y = -CONFIG.deskThickness / 2;         // 机の上面が group の y=0
+  env.group.add(top);
+  const legGeo = new THREE.BoxGeometry(0.04, 1, 0.04);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+    const leg = new THREE.Mesh(legGeo, wood);
+    leg.userData.sx = sx; leg.userData.sz = sz;
+    env.group.add(leg); env.legs.push(leg);
+  }
+  env.cube = new THREE.Mesh(
+    new THREE.BoxGeometry(CONFIG.cubeSize, CONFIG.cubeSize, CONFIG.cubeSize),
+    new THREE.MeshLambertMaterial({ color: CONFIG.colorCube })
+  );
+  env.cube.position.set(CONFIG.cubeLocalX, CONFIG.cubeSize / 2, CONFIG.cubeLocalZ);
+  env.group.add(env.cube);
+  env.group.visible = false;
+  scene.add(env.group);
+}
+function anchorEnvironment() {
+  if (env.anchored || !body.valid) return;
+  const topY = body.shoulderCenter.y - CONFIG.deskTopBelowShoulder;
+  if (!(topY > 0.3)) return;                           // 異常値ガード
+  env.group.position.set(
+    body.shoulderCenter.x + body.forward.x * CONFIG.deskForward, topY,
+    body.shoulderCenter.z + body.forward.z * CONFIG.deskForward);
+  env.group.rotation.y = -body.yaw;
+  const legH = topY - CONFIG.deskThickness;
+  for (const leg of env.legs) {
+    leg.scale.y = legH;
+    leg.position.set(leg.userData.sx * (CONFIG.deskWidth / 2 - 0.04), -CONFIG.deskThickness - legH / 2, leg.userData.sz * (CONFIG.deskDepth / 2 - 0.04));
+  }
+  env.group.visible = true;
+  env.anchored = true;
+}
+renderer.xr.addEventListener('sessionstart', () => { env.anchored = false; env.group.visible = false; body.yawInit = false; });
+
 /* ========== メインループ ========== */
 const clock = new THREE.Clock();
 renderer.setAnimationLoop((time, frame) => {
@@ -463,6 +517,7 @@ renderer.setAnimationLoop((time, frame) => {
   if (renderer.xr.isPresenting) updateTracked(frame); else clearTracked();
 
   updateBody(dt);
+  anchorEnvironment();
   estimated.valid = false;
   if (body.valid && tracked.rightWristTracked) {
     estimateRightShoulder();
