@@ -66,6 +66,11 @@ const CONFIG = {
   cubeLocalX: -0.18,                                 // 机中心から左方向 (仮想左手の側)
   cubeLocalZ: 0.07,                                  // 机中心より手前
   colorCube: 0xe53935,
+  // --- 課題 ---
+  cubeCount: Math.max(1, Math.min(6, Math.round(num('n', 4)))),                          // cubeの個数 (?n=1〜6)
+  taskMode: ['stack', 'line', 'free'].includes(qs.get('task')) ? qs.get('task') : 'stack',   // ?task=stack(積み上げ) / line(並べる) / free(課題なし)
+  stackX: num('sx', 0.04), stackZ: num('sz', 0.12),                                      // 積み上げる場所 (机の中心から右へ / 手前へ, m)
+  lineX: num('lx', -0.02), lineZ: num('lz', 0.19), lineSpacing: 0.07,                    // 並べる枠の中心と間隔
   // --- 腕の太さ (m): 近位(体幹側)がやや太く、遠位が細い円錐形 ---
   upperArmRadiusProx: num('uap', 0.036), upperArmRadiusDist: num('uad', 0.029),
   forearmRadiusProx: num('fap', 0.029), forearmRadiusDist: num('fad', 0.023),
@@ -529,15 +534,16 @@ function debugLines() {
     `Pinch distance: ${Number.isFinite(pinch.distance) ? mm(pinch.distance) + ' mm' : '--'}`,
     `Cube grabbed: ${grab.active ? 'YES' : 'NO'}`,
     `Hand model: ${realistic.ready ? 'MESH (Meta)' : 'SIMPLE (fallback)'}`,
+    ...taskLines(),
   ];
 }
 const hudCanvas = document.createElement('canvas');
-hudCanvas.width = 512; hudCanvas.height = 458;
+hudCanvas.width = 512; hudCanvas.height = 536;
 const hudG = hudCanvas.getContext('2d');
 const hudTex = new THREE.CanvasTexture(hudCanvas);
 hudTex.colorSpace = THREE.SRGBColorSpace;
 const hudMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(0.4, 0.358),
+  new THREE.PlaneGeometry(0.4, 0.419),
   new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false })
 );
 hudMesh.position.set(-0.3, -0.25, -0.9);
@@ -552,9 +558,9 @@ function updateDebug(dt) {
   hudT = 0;
   const lines = debugLines();
   panelEl.textContent = 'Mirror Arm - Phase 4\n' + lines.join('\n');
-  hudG.clearRect(0, 0, 512, 458);
+  hudG.clearRect(0, 0, 512, 536);
   hudG.fillStyle = 'rgba(0,0,0,0.6)';
-  hudG.fillRect(0, 0, 512, 458);
+  hudG.fillRect(0, 0, 512, 536);
   hudG.font = 'bold 26px sans-serif';
   hudG.textBaseline = 'middle';
   lines.forEach((t, i) => {
@@ -583,14 +589,29 @@ const env = { anchored: false, group: new THREE.Group(), legs: [], cube: null };
     leg.userData.sx = sx; leg.userData.sz = sz;
     env.group.add(leg); env.legs.push(leg);
   }
-  env.cube = new THREE.Mesh(
-    new THREE.BoxGeometry(CONFIG.cubeSize, CONFIG.cubeSize, CONFIG.cubeSize),
-    new THREE.MeshLambertMaterial({ color: CONFIG.colorCube })
-  );
-  env.cube.position.set(CONFIG.cubeLocalX, CONFIG.cubeSize / 2, CONFIG.cubeLocalZ);
-  env.group.add(env.cube);
+  env.cubes = [];                                        // 色違いのcubeを複数個。env.cube は「つかんでいる(または直近に触った)cube」
+  const palette = [0xe53935, 0x1e88e5, 0x43a047, 0xfdd835, 0x8e24aa, 0xfb8c00];
+  const cubeGeo = new THREE.BoxGeometry(CONFIG.cubeSize, CONFIG.cubeSize, CONFIG.cubeSize);
+  for (let i = 0; i < CONFIG.cubeCount; i++) {
+    const m = new THREE.Mesh(cubeGeo, new THREE.MeshLambertMaterial({ color: palette[i % palette.length] }));
+    m.userData.vy = 0;
+    env.group.add(m);
+    env.cubes.push(m);
+  }
+  env.cube = env.cubes[0];
   env.group.visible = false;
   scene.add(env.group);
+}
+function resetCubes() {                                  // cubeを机の左側(仮想左手が届く側)に格子状に並べる
+  const cols = Math.min(CONFIG.cubeCount, 4), sp = CONFIG.cubeSize * 1.5;
+  env.cubes.forEach((m, i) => {
+    const c = i % cols, r = Math.floor(i / cols);
+    m.position.set(CONFIG.cubeLocalX + (c - (cols - 1) / 2) * sp, CONFIG.cubeSize / 2, CONFIG.cubeLocalZ - r * sp);
+    m.quaternion.identity();
+    m.userData.vy = 0;
+    m.material.emissive.setHex(0x000000);
+  });
+  env.cube = env.cubes[0];
 }
 function anchorEnvironment() {
   if (env.anchored || !body.valid) return;
@@ -608,6 +629,8 @@ function anchorEnvironment() {
   env.group.visible = true;
   env.anchored = true;
   env.group.updateMatrixWorld(true);
+  resetCubes();
+  resetTask();
 }
 renderer.xr.addEventListener('sessionstart', () => { env.anchored = false; env.group.visible = false; body.yawInit = false; });
 
@@ -715,7 +738,7 @@ function releaseCube(reason) {
   if (!grab.active) return;
   grab.active = false; grab.vy = 0;
   levelCube();
-  env.cube.material.color.set(CONFIG.colorCube);
+  env.cube.material.emissive.setHex(0x000000);
   logEvent('grab_release', { reason, cube: env.cube.position.toArray() });
 }
 function updateGrab(dt) {
@@ -737,38 +760,52 @@ function updateGrab(dt) {
       _tw.add(virtualPinch.point);
       if (finite3(_tw)) env.cube.position.copy(env.group.worldToLocal(_tw));
       const cp = env.cube.position;                                     // つかんでいても、机の上面・床より下には入れない
-      const minY = cubeSupportLocalY(cp) + cubeHalfHeight();
+      const minY = cubeSupportLocalY(cp, env.cube) + cubeHalfHeight(env.cube);
       if (cp.y < minY) cp.y = minY;
     }
   } else if (safe && pinch.on) {
-    env.cube.getWorldPosition(_cw);
-    if (virtualPinch.point.distanceTo(_cw) < CONFIG.grabRange) {
+    let best = null, bestD = CONFIG.grabRange;                          // 把持範囲内で最も近いcubeをつかむ
+    for (const cb of env.cubes) {
+      cb.getWorldPosition(_cw);
+      const d = virtualPinch.point.distanceTo(_cw);
+      if (d < bestD) { bestD = d; best = cb; }
+    }
+    if (best) {
+      env.cube = best;
+      env.cube.getWorldPosition(_cw);
       grab.active = true; grab.vy = 0;
       grab.offset.subVectors(_cw, virtualPinch.point);
       grab.hasFrame = computeLeftHandFrame(grab.handQ0);
       grab.cubeQ0World.copy(env.group.quaternion).multiply(env.cube.quaternion);
       alignCubeToPinchAxis();
-      env.cube.material.color.set(0xffb300);
+      env.cube.material.emissive.setHex(0x553300);                      // つかんでいるcubeを少し光らせる
       logEvent('grab_onset', { cube: env.cube.position.toArray() });
     }
   }
-  if (!grab.active) settleCube(dt);
+  for (const cb of env.cubes) if (!(grab.active && cb === env.cube)) settleCube(cb, dt);   // つかんでいないcubeは全て、面(机・床・他のcubeの上)へ落ち着かせる
 }
-function cubeHalfHeight() {                                           // 傾いたcubeの、中心から最下点までの高さ
-  const q = env.cube.quaternion, h = CONFIG.cubeSize / 2;
+function cubeHalfHeight(cube = env.cube) {                            // 傾いたcubeの、中心から最下点までの高さ
+  const q = cube.quaternion, h = CONFIG.cubeSize / 2;
   return h * (Math.abs(_va.set(1, 0, 0).applyQuaternion(q).y) + Math.abs(_va.set(0, 1, 0).applyQuaternion(q).y) + Math.abs(_va.set(0, 0, 1).applyQuaternion(q).y));
 }
-function cubeSupportLocalY(c) {                                       // cubeの下にある面(机の上面 or 床)の高さ (机のローカル座標)
+function cubeSupportLocalY(c, self = null) {                          // cubeの下にある面(机の上面 or 床 or 他のcubeの上面)の高さ (机のローカル座標)
   const overDesk = Math.abs(c.x) < CONFIG.deskWidth / 2 && Math.abs(c.z) < CONFIG.deskDepth / 2;
-  return (overDesk && c.y > -CONFIG.deskThickness) ? 0 : -env.group.position.y;
+  let y = (overDesk && c.y > -CONFIG.deskThickness) ? 0 : -env.group.position.y;
+  const half = CONFIG.cubeSize / 2;
+  for (const o of env.cubes) {                                        // 中心が下のcubeの上面の範囲内にあれば、その上に乗る
+    if (o === self) continue;
+    const p = o.position;
+    if (Math.abs(c.x - p.x) < half && Math.abs(c.z - p.z) < half && c.y > p.y) y = Math.max(y, p.y + cubeHalfHeight(o));
+  }
+  return y;
 }
-function settleCube(dt) {                                             // 高度なphysicsではなく、机の上面か床へ落とすだけ
-  const c = env.cube.position;
-  const rest = cubeSupportLocalY(c) + cubeHalfHeight();               // めり込んでいる場合も、ここで面の上へ戻す
+function settleCube(cube, dt) {                                             // 高度なphysicsではなく、机の上面か床へ落とすだけ
+  const c = cube.position;
+  const rest = cubeSupportLocalY(c, cube) + cubeHalfHeight(cube);               // めり込んでいる場合も、ここで面の上へ戻す
   if (c.y > rest + 1e-4) {
-    grab.vy -= CONFIG.gravity * dt;
-    c.y = Math.max(rest, c.y + grab.vy * dt);
-  } else { c.y = rest; grab.vy = 0; }
+    cube.userData.vy = (cube.userData.vy || 0) - CONFIG.gravity * dt;
+    c.y = Math.max(rest, c.y + cube.userData.vy * dt);
+  } else { c.y = rest; cube.userData.vy = 0; }
 }
 const pinchMarker = new THREE.Mesh(new THREE.SphereGeometry(0.012, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffd400 }));
 pinchMarker.visible = false;
@@ -779,7 +816,7 @@ function renderPinchMarker() {
   pinchMarker.position.copy(virtualPinch.point);
   pinchMarker.scale.setScalar(pinch.on ? 1.6 : 1);
 }
-renderer.xr.addEventListener('sessionstart', () => { pinch.on = false; grab.active = false; env.cube.material.color.set(CONFIG.colorCube); });
+renderer.xr.addEventListener('sessionstart', () => { pinch.on = false; grab.active = false; env.cubes.forEach(m => m.material.emissive.setHex(0x000000)); });
 
 /* ==========================================================
    RealisticHands: Meta/three.js公式例と同じ手モデル(glb)を使った、人に近い手
@@ -1152,6 +1189,63 @@ function updateRealisticHands() {
   restHand.holder.visible = restHand.ready && CONFIG.rightMode === 'rest' && env.anchored;
 }
 
+/* ==========================================================
+   Task: 積み上げ課題 (stack) / 並べる課題 (line) / 課題なし (free)
+   - stack: 机の上の目印の場所に、cubeを積む。積めた高さ(連続した段数)を数える。
+   - line : cubeと同じ色の枠が並ぶ。各cubeを対応する枠に置く。置けた個数を数える。
+   - 最初につかんだ時点で計測を開始し、完了で停止する。
+   ========================================================== */
+const taskState = { mode: CONFIG.taskMode, started: false, done: false, t0: 0, t1: 0, progress: 0, total: 0 };
+const taskMarks = new THREE.Group();                   // 机の上の目印 (机のローカル座標)
+env.group.add(taskMarks);
+const slotGeo = new THREE.PlaneGeometry(CONFIG.cubeSize * 1.5, CONFIG.cubeSize * 1.5).rotateX(-Math.PI / 2);
+function slotPos(i) { return { x: CONFIG.lineX + (i - (CONFIG.cubeCount - 1) / 2) * CONFIG.lineSpacing, z: CONFIG.lineZ }; }
+function resetTask() {
+  taskState.started = false; taskState.done = false; taskState.progress = 0; taskState.t0 = 0; taskState.t1 = 0;
+  for (const c of [...taskMarks.children]) { taskMarks.remove(c); c.material.dispose(); }
+  const mk = (x, z, color) => {
+    const m = new THREE.Mesh(slotGeo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.5 }));
+    m.position.set(x, 0.002, z);
+    taskMarks.add(m);
+  };
+  if (taskState.mode === 'stack') { taskState.total = CONFIG.cubeCount; mk(CONFIG.stackX, CONFIG.stackZ, 0x4a90d9); }
+  else if (taskState.mode === 'line') {
+    taskState.total = CONFIG.cubeCount;
+    for (let i = 0; i < CONFIG.cubeCount; i++) { const p = slotPos(i); mk(p.x, p.z, env.cubes[i].material.color.getHex()); }
+  } else taskState.total = 0;
+}
+function updateTask() {
+  if (!env.anchored || taskState.mode === 'free') return;
+  const h = CONFIG.cubeSize / 2;
+  let p = 0;
+  if (taskState.mode === 'stack') {                    // 目印の範囲にあるcubeの、下から連続した段数
+    const levels = new Set(), tol = CONFIG.cubeSize * 0.75;
+    for (const m of env.cubes) {
+      if (grab.active && m === env.cube) continue;
+      if (Math.abs(m.position.x - CONFIG.stackX) < tol && Math.abs(m.position.z - CONFIG.stackZ) < tol) levels.add(Math.round((m.position.y - h) / CONFIG.cubeSize));
+    }
+    while (levels.has(p)) p++;
+  } else {                                             // 各cubeが、対応する色の枠の上に置かれている個数
+    env.cubes.forEach((m, i) => {
+      if (grab.active && m === env.cube) return;
+      const s = slotPos(i);
+      if (Math.abs(m.position.x - s.x) < 0.03 && Math.abs(m.position.z - s.z) < 0.03 && Math.abs(m.position.y - h) < 0.006) p++;
+    });
+  }
+  taskState.progress = p;
+  if (!taskState.started && grab.active) { taskState.started = true; taskState.t0 = performance.now(); logEvent('task_start', { mode: taskState.mode }); }
+  if (taskState.started && !taskState.done && p >= taskState.total) {
+    taskState.done = true; taskState.t1 = performance.now();
+    logEvent('task_complete', { mode: taskState.mode, seconds: (taskState.t1 - taskState.t0) / 1000 });
+    for (const c of taskMarks.children) c.material.color.setHex(0x43a047);   // 完了: 目印を緑に
+  }
+}
+function taskLines() {
+  if (taskState.mode === 'free') return ['Task: FREE'];
+  const ms = taskState.started ? (taskState.done ? taskState.t1 : performance.now()) - taskState.t0 : 0;
+  return [`Task: ${taskState.mode.toUpperCase()}  ${taskState.progress} / ${taskState.total}${taskState.done ? '  DONE' : ''}`, `Time: ${(ms / 1000).toFixed(1)} s`];
+}
+
 /* ========== メインループ ========== */
 const clock = new THREE.Clock();
 renderer.setAnimationLoop((time, frame) => {
@@ -1174,6 +1268,7 @@ renderer.setAnimationLoop((time, frame) => {
   updateVirtualPinchPoint();
   updateGrab(dt);
   applyGripPose(dt);
+  updateTask();
   if (prevRightTracking && !tracked.rightHandTracking) logEvent('tracking_loss');
   prevRightTracking = tracked.rightHandTracking;
   renderPinchMarker();
