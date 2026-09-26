@@ -64,6 +64,11 @@ const CONFIG = {
   cubeLocalX: -0.18,                                 // 机中心から左方向 (仮想左手の側)
   cubeLocalZ: 0.07,                                  // 机中心より手前
   colorCube: 0xe53935,
+  // --- pinch / grab (操作用の初期値。科学的に検証された閾値ではない) ---
+  pinchOnThreshold: num('pn', 0.030),                // thumb-tip と index-tip の距離がこれ未満でON (m)
+  pinchOffThreshold: num('pf', 0.045),               // これを超えたらOFF (ヒステリシス)
+  grabRange: num('gr', 0.06),                        // 仮想pinch点からcube中心までの把持可能距離 (m)
+  gravity: 9.8,                                      // release後にcubeを机/床へ落とす簡易処理用
 };
 
 /* ========== WebXR Hand Input の25関節 ========== */
@@ -429,15 +434,18 @@ function debugLines() {
     `IK status: ${estimated.ikStatus}`,
     `Reach: ${mm(estimated.reachDist)} / ${mm(estimated.reachMax)} mm`,
     `Virtual left arm: ${mirrored.valid ? 'ON (MIRRORED)' : 'OFF'}`,
+    `Pinch: ${pinch.on ? 'ON' : 'OFF'}`,
+    `Pinch distance: ${Number.isFinite(pinch.distance) ? mm(pinch.distance) + ' mm' : '--'}`,
+    `Cube grabbed: ${grab.active ? 'YES' : 'NO'}`,
   ];
 }
 const hudCanvas = document.createElement('canvas');
-hudCanvas.width = 512; hudCanvas.height = 336;
+hudCanvas.width = 512; hudCanvas.height = 424;
 const hudG = hudCanvas.getContext('2d');
 const hudTex = new THREE.CanvasTexture(hudCanvas);
 hudTex.colorSpace = THREE.SRGBColorSpace;
 const hudMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(0.4, 0.2625),
+  new THREE.PlaneGeometry(0.4, 0.331),
   new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false })
 );
 hudMesh.position.set(-0.3, -0.25, -0.9);
@@ -451,10 +459,10 @@ function updateDebug(dt) {
   if (hudT < 0.2) return;
   hudT = 0;
   const lines = debugLines();
-  panelEl.textContent = 'Mirror Arm - Phase 1C\n' + lines.join('\n');
-  hudG.clearRect(0, 0, 512, 336);
+  panelEl.textContent = 'Mirror Arm - Phase 4\n' + lines.join('\n');
+  hudG.clearRect(0, 0, 512, 424);
   hudG.fillStyle = 'rgba(0,0,0,0.6)';
-  hudG.fillRect(0, 0, 512, 336);
+  hudG.fillRect(0, 0, 512, 424);
   hudG.font = 'bold 26px sans-serif';
   hudG.textBaseline = 'middle';
   lines.forEach((t, i) => {
@@ -507,8 +515,95 @@ function anchorEnvironment() {
   }
   env.group.visible = true;
   env.anchored = true;
+  env.group.updateMatrixWorld(true);
 }
 renderer.xr.addEventListener('sessionstart', () => { env.anchored = false; env.group.visible = false; body.yawInit = false; });
+
+/* ==========================================================
+   PinchDetector / GrabInteraction (Phase 3-4)
+   - pinch判定: 実右手の thumb-tip と index-finger-tip の距離 (TRACKED)
+   - 仮想pinch点: 反転した(MIRRORED) thumb-tip と index-tip の中点
+   - cubeを把持できるのは仮想左手のみ (実右手はcubeと相互作用しない)
+   ========================================================== */
+const IDX_THUMB_TIP = JOINT_NAMES.indexOf('thumb-tip');
+const IDX_INDEX_TIP = JOINT_NAMES.indexOf('index-finger-tip');
+const pinch = { on: false, valid: false, distance: NaN };
+const virtualPinch = { valid: false, point: new THREE.Vector3() };   // MIRRORED / GENERATED
+const grab = { active: false, offset: new THREE.Vector3(), vy: 0 };
+const eventLog = [];                                                  // 将来のログ記録用の下地
+function logEvent(type, extra = {}) {
+  if (eventLog.length < 5000) eventLog.push({ t: performance.now(), type, ...extra });
+}
+let prevRightTracking = false;
+
+function updatePinch() {
+  const R = tracked.rightHandJoints, a = R[IDX_THUMB_TIP], b = R[IDX_INDEX_TIP];
+  if (!tracked.rightHandTracking || !a.tracked || !b.tracked) {
+    if (pinch.on) logEvent('pinch_release', { reason: 'tracking_loss' });
+    pinch.on = false; pinch.valid = false; pinch.distance = NaN;
+    return;
+  }
+  const d = a.position.distanceTo(b.position);
+  if (!Number.isFinite(d)) { pinch.on = false; pinch.valid = false; pinch.distance = NaN; return; }
+  pinch.valid = true; pinch.distance = d;
+  if (!pinch.on && d < CONFIG.pinchOnThreshold) { pinch.on = true; logEvent('pinch_onset', { distance: d }); }
+  else if (pinch.on && d > CONFIG.pinchOffThreshold) { pinch.on = false; logEvent('pinch_release', { distance: d }); }
+}
+function updateVirtualPinchPoint() {
+  const L = mirrored.leftHandJoints, a = L[IDX_THUMB_TIP], b = L[IDX_INDEX_TIP];
+  virtualPinch.valid = mirrored.valid && a.generated && b.generated;
+  if (virtualPinch.valid) {
+    virtualPinch.point.addVectors(a.position, b.position).multiplyScalar(0.5);
+    if (!finite3(virtualPinch.point)) virtualPinch.valid = false;
+  }
+}
+const _cw = new THREE.Vector3(), _tw = new THREE.Vector3();
+function releaseCube(reason) {
+  if (!grab.active) return;
+  grab.active = false; grab.vy = 0;
+  env.cube.material.color.set(CONFIG.colorCube);
+  logEvent('grab_release', { reason, cube: env.cube.position.toArray() });
+}
+function updateGrab(dt) {
+  if (!env.anchored) return;
+  const safe = pinch.valid && virtualPinch.valid;                     // trackingが失われたら安全側 (grab解除)
+  if (grab.active) {
+    if (!safe) releaseCube('tracking_loss');
+    else if (!pinch.on) releaseCube('pinch_off');
+    else {
+      _tw.copy(virtualPinch.point).add(grab.offset);
+      if (finite3(_tw)) env.cube.position.copy(env.group.worldToLocal(_tw));
+    }
+  } else if (safe && pinch.on) {
+    env.cube.getWorldPosition(_cw);
+    if (virtualPinch.point.distanceTo(_cw) < CONFIG.grabRange) {
+      grab.active = true; grab.vy = 0;
+      grab.offset.subVectors(_cw, virtualPinch.point);
+      env.cube.material.color.set(0xffb300);
+      logEvent('grab_onset', { cube: env.cube.position.toArray() });
+    }
+  }
+  if (!grab.active) settleCube(dt);
+}
+function settleCube(dt) {                                             // 高度なphysicsではなく、机の上面か床へ落とすだけ
+  const c = env.cube.position, h = CONFIG.cubeSize / 2;
+  const overDesk = Math.abs(c.x) < CONFIG.deskWidth / 2 && Math.abs(c.z) < CONFIG.deskDepth / 2 && (c.y - h) >= -0.02;
+  const rest = (overDesk ? 0 : -env.group.position.y) + h;
+  if (c.y > rest + 1e-4) {
+    grab.vy -= CONFIG.gravity * dt;
+    c.y = Math.max(rest, c.y + grab.vy * dt);
+  } else { c.y = rest; grab.vy = 0; }
+}
+const pinchMarker = new THREE.Mesh(new THREE.SphereGeometry(0.012, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffd400 }));
+pinchMarker.visible = false;
+scene.add(pinchMarker);
+function renderPinchMarker() {
+  pinchMarker.visible = virtualPinch.valid;
+  if (!virtualPinch.valid) return;
+  pinchMarker.position.copy(virtualPinch.point);
+  pinchMarker.scale.setScalar(pinch.on ? 1.6 : 1);
+}
+renderer.xr.addEventListener('sessionstart', () => { pinch.on = false; grab.active = false; env.cube.material.color.set(CONFIG.colorCube); });
 
 /* ========== メインループ ========== */
 const clock = new THREE.Clock();
@@ -527,6 +622,12 @@ renderer.setAnimationLoop((time, frame) => {
   }
 
   updateMirror();
+  updatePinch();
+  updateVirtualPinchPoint();
+  updateGrab(dt);
+  if (prevRightTracking && !tracked.rightHandTracking) logEvent('tracking_loss');
+  prevRightTracking = tracked.rightHandTracking;
+  renderPinchMarker();
   renderRightHand();
   renderRightArm();
   renderLeftArm();
