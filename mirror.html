@@ -45,6 +45,7 @@ const CONFIG = {
   // --- 肘の曲がる向き (身体座標: 右+, 上+, 前+)。外側・下・やや後方 ---
   elbowPoleBody: { right: 0.5, up: -0.8, forward: -0.3 },
   bodyYawSmoothingSec: 0.25,                         // 身体向き(yaw)の平滑化
+  bodyYawFollowLimitRad: num('yl', 50) * Math.PI / 180,  // 頭が体幹に対してこの角度までは体幹は動かない (首振り想定)。?yl=0 で頭に完全追従
   ikReachMargin: 0.999,
   ikBendSmoothingSec: 0.05,                          // 肘の向きの連続性 (急な切り替え防止)
   // --- 表示色 ---
@@ -162,7 +163,11 @@ function updateBody(dt) {
   if (hl > 0.05) {
     const target = Math.atan2(fx, -fz);
     if (!body.yawInit) { body.yaw = target; body.yawInit = true; }
-    else body.yaw = wrapPi(body.yaw + wrapPi(target - body.yaw) * (1 - Math.exp(-dt / CONFIG.bodyYawSmoothingSec)));
+    else {
+      const delta = wrapPi(target - body.yaw), lim = CONFIG.bodyYawFollowLimitRad;
+      const excess = delta - Math.max(-lim, Math.min(lim, delta));   // 限界を超えた分だけ体幹が追従
+      body.yaw = wrapPi(body.yaw + excess * (1 - Math.exp(-dt / CONFIG.bodyYawSmoothingSec)));
+    }
   }
   body.forward.set(Math.sin(body.yaw), 0, -Math.cos(body.yaw));
   body.up.set(0, 1, 0);
