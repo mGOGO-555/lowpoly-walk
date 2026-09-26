@@ -66,12 +66,16 @@ const CONFIG = {
   cubeLocalX: -0.18,                                 // 机中心から左方向 (仮想左手の側)
   cubeLocalZ: 0.07,                                  // 机中心より手前
   colorCube: 0xe53935,
+  // --- 腕の太さ (m): 近位(体幹側)がやや太く、遠位が細い円錐形 ---
+  upperArmRadiusProx: num('uap', 0.036), upperArmRadiusDist: num('uad', 0.029),
+  forearmRadiusProx: num('fap', 0.029), forearmRadiusDist: num('fad', 0.023),
+  gripPadding: num('gp', 0.006),                     // つかんでいる間、指先の間隔を cubeSize + この値 に保って表示 (めり込み防止)
   colorSkin: 0xe8b898,                               // 手の色 (肌色)
   showSkeleton: qs.get('skel') === '1',              // ?skel=1 でデバッグ用の骨格(球と線)も重ねて表示
   rightMode: (() => { const r = qs.get('right'); return (r === 'live' || r === '1') ? 'live' : (r === 'off' || r === '0') ? 'off' : 'rest'; })(),
   // 右上肢の表示: 'rest'(既定)=動かない右手を机上に休めて固定 / 'live'=実右手の動きを表示(確認用) / 'off'=非表示。?right=live など
   restHandX: num('rx', 0.20),                        // 休めた右手の手首位置 (机の中心から右へ, m)
-  restHandY: num('ry', 0.022),                       // 机の上面からの高さ
+  restHandY: num('ry', 0.002), restHandPad: num('rp', 0.010),                       // 机の上面からの高さ
   restHandZ: num('rz', 0.22),                        // 机の中心から手前へ
   // --- pinch / grab (操作用の初期値。科学的に検証された閾値ではない) ---
   pinchOnThreshold: num('pn', 0.030),                // thumb-tip と index-tip の距離がこれ未満でON (m)
@@ -361,10 +365,10 @@ function renderRightHand() {
 
 // 右上肢 (ESTIMATED = オレンジ): 肩・肘の球、上腕・前腕の円柱
 const estMat = new THREE.MeshLambertMaterial({ color: CONFIG.colorEstimated });
-const shoulderMesh = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), estMat);
-const elbowMesh = new THREE.Mesh(new THREE.SphereGeometry(0.03, 16, 12), estMat);
-const upperArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1, 12), estMat);
-const forearmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 1, 12), estMat);
+const shoulderMesh = new THREE.Mesh(new THREE.SphereGeometry(CONFIG.upperArmRadiusProx * 1.05, 16, 12), estMat);
+const elbowMesh = new THREE.Mesh(new THREE.SphereGeometry(CONFIG.upperArmRadiusDist, 16, 12), estMat);
+const upperArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(CONFIG.upperArmRadiusDist, CONFIG.upperArmRadiusProx, 1, 16), estMat);   // 上=遠位(肘側), 下=近位(肩側)
+const forearmMesh = new THREE.Mesh(new THREE.CylinderGeometry(CONFIG.forearmRadiusDist, CONFIG.forearmRadiusProx, 1, 16), estMat);
 const armGroup = new THREE.Group();
 armGroup.add(shoulderMesh, elbowMesh, upperArmMesh, forearmMesh);
 armGroup.visible = false;
@@ -393,10 +397,10 @@ function renderRightArm() {
 
 // 仮想左上肢 (MIRRORED = 緑): 右と同じ構成
 const mirMat = new THREE.MeshLambertMaterial({ color: CONFIG.colorMirrored });
-const lShoulderMesh = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), mirMat);
-const lElbowMesh = new THREE.Mesh(new THREE.SphereGeometry(0.03, 16, 12), mirMat);
-const lUpperArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1, 12), mirMat);
-const lForearmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 1, 12), mirMat);
+const lShoulderMesh = new THREE.Mesh(new THREE.SphereGeometry(CONFIG.upperArmRadiusProx * 1.05, 16, 12), mirMat);
+const lElbowMesh = new THREE.Mesh(new THREE.SphereGeometry(CONFIG.upperArmRadiusDist, 16, 12), mirMat);
+const lUpperArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(CONFIG.upperArmRadiusDist, CONFIG.upperArmRadiusProx, 1, 16), mirMat);
+const lForearmMesh = new THREE.Mesh(new THREE.CylinderGeometry(CONFIG.forearmRadiusDist, CONFIG.forearmRadiusProx, 1, 16), mirMat);
 const leftArmGroup = new THREE.Group();
 leftArmGroup.add(lShoulderMesh, lElbowMesh, lUpperArmMesh, lForearmMesh);
 leftArmGroup.visible = false;
@@ -694,6 +698,7 @@ function updateGrab(dt) {
     if (!safe) releaseCube('tracking_loss');
     else if (!pinch.on) releaseCube('pinch_off');
     else {
+      grab.offset.multiplyScalar(Math.exp(-dt / 0.08));                 // cubeを指の中央(仮想pinch点)へなめらかに寄せる
       _tw.copy(grab.offset);
       if (grab.hasFrame && computeLeftHandFrame(_hq)) {
         _dq.copy(_hq).multiply(_hqInv.copy(grab.handQ0).invert());     // 把持開始からの手の回転量 (world)
@@ -712,6 +717,7 @@ function updateGrab(dt) {
       grab.offset.subVectors(_cw, virtualPinch.point);
       grab.hasFrame = computeLeftHandFrame(grab.handQ0);
       grab.cubeQ0World.copy(env.group.quaternion).multiply(env.cube.quaternion);
+      alignCubeToPinchAxis();
       env.cube.material.color.set(0xffb300);
       logEvent('grab_onset', { cube: env.cube.position.toArray() });
     }
@@ -811,6 +817,15 @@ function loadRestHand() {
     const qd = qTarget.multiply(qRest.invert());
     restHand.holder.quaternion.copy(qd);
     restHand.holder.position.copy(restWristLocal).sub(w.clone().applyQuaternion(qd));
+    // 机にめり込まないよう、全ての骨の最下点(骨は指や手のひらの中心線なので、太さの分だけ引く)が机の上面に乗る高さへ持ち上げる
+    let minY = Infinity;
+    obj.traverse(o => {
+      if (!o.isBone) return;
+      const p = o.getWorldPosition(new THREE.Vector3()).applyQuaternion(qd);
+      minY = Math.min(minY, p.y + restHand.holder.position.y);
+    });
+    if (Number.isFinite(minY)) restHand.holder.position.y += CONFIG.restHandY - (minY - CONFIG.restHandPad);
+    restWristLocal.y = restHand.holder.position.y + w.clone().applyQuaternion(qd).y;   // 前腕の終点を実際の手首の高さに合わせる
     tintSkinned(obj);
     restHand.holder.add(obj);
     restHand.ready = true;
@@ -862,6 +877,58 @@ function updateRestArm(dt) {
   restArm.valid = twoBoneIK(restArm.shoulder, _rw, restArm, dt);
 }
 
+/* ==========================================================
+   GripClearance: cubeをつかんでいる間、親指と人差し指の先の間隔を cubeSize + gripPadding 以上に保って表示する
+   (実際の指は何も無い空間でつまむので、そのままだと表示の指がcubeにめり込む)。
+   表示専用: pinch判定・仮想pinch点は実測の関節位置のまま。
+   ========================================================== */
+const THUMB_CHAIN = { names: ['thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip'], w: [0, 0.3, 0.65, 1] };
+const INDEX_CHAIN = { names: ['index-finger-metacarpal', 'index-finger-phalanx-proximal', 'index-finger-phalanx-intermediate', 'index-finger-phalanx-distal', 'index-finger-tip'], w: [0, 0.15, 0.5, 0.8, 1] };
+const grip = { k: 0 };
+const _gu = new THREE.Vector3(), _q1 = new THREE.Quaternion();
+const _pa = new THREE.Vector3(), _ca = new THREE.Vector3(), _cb = new THREE.Vector3(), _aq = new THREE.Quaternion();
+function shiftChain(J, chain, vec) {                   // 先端をvecだけ、根元側ほど小さくずらし、骨の向きも新しい方向へ回す
+  const objs = chain.names.map(n => J[n]);
+  if (objs.some(o => !o || !o.visible)) return;
+  const oldP = objs.map(o => o.position.clone());
+  const newP = oldP.map((p, i) => p.clone().addScaledVector(vec, chain.w[i]));
+  for (let i = 0; i < objs.length; i++) {
+    const j = Math.min(i, objs.length - 2);             // 先端は直前の骨と同じ回転
+    const a0 = oldP[j + 1].clone().sub(oldP[j]), a1 = newP[j + 1].clone().sub(newP[j]);
+    if (a0.lengthSq() > 1e-10 && a1.lengthSq() > 1e-10) { _q1.setFromUnitVectors(a0.normalize(), a1.normalize()); objs[i].quaternion.premultiply(_q1); }
+    objs[i].position.copy(newP[i]);
+  }
+}
+function applyGripClearance(dt) {
+  grip.k += ((grab.active ? 1 : 0) - grip.k) * (1 - Math.exp(-dt / 0.08));   // つかむ/離すときになめらかに開閉
+  if (grip.k < 0.01 || !realistic.ready) return;
+  const e = realistic.entries.find(en => en.h.userData.handedness === 'right');
+  if (!e || !e.h.joints) return;
+  const J = e.h.joints, t = J['thumb-tip'], ix = J['index-finger-tip'];
+  if (!t || !ix || !t.visible || !ix.visible) return;
+  _gu.subVectors(t.position, ix.position);
+  const dist = _gu.length(), gap = CONFIG.cubeSize + CONFIG.gripPadding;
+  if (dist < 1e-6 || dist >= gap) return;
+  _gu.divideScalar(dist);
+  const half = (gap - dist) * 0.5 * grip.k;
+  shiftChain(J, THUMB_CHAIN, _gu.clone().multiplyScalar(half));
+  shiftChain(J, INDEX_CHAIN, _gu.clone().multiplyScalar(-half));
+}
+function alignCubeToPinchAxis() {                      // つかむ瞬間、cubeの面が親指-人差し指の方向に垂直になるよう姿勢を補正
+  const L = mirrored.leftHandJoints;
+  _pa.subVectors(L[IDX_THUMB_TIP].position, L[IDX_INDEX_TIP].position);
+  if (_pa.lengthSq() < 1e-8) return;
+  _pa.normalize();
+  let best = -1;
+  for (const ax of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) {
+    _ca.set(ax[0], ax[1], ax[2]).applyQuaternion(grab.cubeQ0World);
+    const d = _ca.dot(_pa);
+    if (Math.abs(d) > best) { best = Math.abs(d); _cb.copy(_ca).multiplyScalar(Math.sign(d) || 1); }
+  }
+  _aq.setFromUnitVectors(_cb, _pa);
+  grab.cubeQ0World.premultiply(_aq);
+}
+
 function updateRealisticHands() {
   for (const e of realistic.entries) {                 // 右手のモデルが読み込まれたら肌色にして「使用可能」とする
     if (e.tinted || e.h.userData.handedness !== 'right') continue;
@@ -894,6 +961,7 @@ renderer.setAnimationLoop((time, frame) => {
   updatePinch();
   updateVirtualPinchPoint();
   updateGrab(dt);
+  applyGripClearance(dt);
   if (prevRightTracking && !tracked.rightHandTracking) logEvent('tracking_loss');
   prevRightTracking = tracked.rightHandTracking;
   renderPinchMarker();
