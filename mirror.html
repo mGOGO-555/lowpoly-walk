@@ -51,6 +51,8 @@ const CONFIG = {
   colorTracked: 0x4fc3f7,     // TRACKED = 青
   colorTrackedBone: 0x9ad8ff,
   colorEstimated: 0xffa040,   // ESTIMATED = オレンジ
+  colorMirrored: 0x66dd77,    // MIRRORED / GENERATED = 緑
+  colorMirroredBone: 0xb5f0bd,
 };
 
 /* ========== WebXR Hand Input の25関節 ========== */
@@ -241,6 +243,41 @@ function solveRightArmIK(dt) {
   return true;
 }
 
+/* ==========================================================
+   MirrorTransform: MIRRORED / GENERATED (実左手は使用しない)
+   鏡映面 = 推定した正中面 (点: 肩の中央, 法線: 身体の左右軸)
+   位置のみを反転し、向きは反転後の位置から再構成する。
+   ========================================================== */
+const mirrored = {
+  valid: false,
+  leftShoulder: new THREE.Vector3(),
+  leftElbow: new THREE.Vector3(),
+  leftWrist: new THREE.Vector3(),     // 右のIK目標(表示用手首)の鏡像
+  leftHandJoints: JOINT_NAMES.map(name => ({ name, generated: false, position: new THREE.Vector3() })),
+};
+const _mr = new THREE.Vector3();
+function mirrorPoint(src, out) {
+  _mr.subVectors(src, body.shoulderCenter);
+  const s = _mr.dot(body.right);
+  return out.copy(src).addScaledVector(body.right, -2 * s);
+}
+function updateMirror() {
+  mirrored.valid = false;
+  for (const j of mirrored.leftHandJoints) j.generated = false;
+  if (!estimated.valid || !body.valid) return;
+  mirrorPoint(estimated.rightShoulder, mirrored.leftShoulder);
+  mirrorPoint(estimated.rightElbow, mirrored.leftElbow);
+  mirrorPoint(estimated.ikTarget, mirrored.leftWrist);
+  const R = tracked.rightHandJoints;
+  for (let i = 0; i < R.length; i++) {
+    if (!R[i].tracked) continue;
+    const L = mirrored.leftHandJoints[i];
+    mirrorPoint(R[i].position, L.position);
+    L.generated = finite3(L.position);
+  }
+  mirrored.valid = finite3(mirrored.leftShoulder) && finite3(mirrored.leftElbow) && finite3(mirrored.leftWrist);
+}
+
 /* ========== シーン ========== */
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x202428);
@@ -314,6 +351,48 @@ function renderRightArm() {
   placeBone(forearmMesh, estimated.rightElbow, estimated.ikTarget);
 }
 
+// 仮想左上肢 (MIRRORED = 緑): 右と同じ構成
+const mirMat = new THREE.MeshLambertMaterial({ color: CONFIG.colorMirrored });
+const lShoulderMesh = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), mirMat);
+const lElbowMesh = new THREE.Mesh(new THREE.SphereGeometry(0.03, 16, 12), mirMat);
+const lUpperArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1, 12), mirMat);
+const lForearmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 1, 12), mirMat);
+const leftArmGroup = new THREE.Group();
+leftArmGroup.add(lShoulderMesh, lElbowMesh, lUpperArmMesh, lForearmMesh);
+leftArmGroup.visible = false;
+scene.add(leftArmGroup);
+const lJointMat = new THREE.MeshBasicMaterial({ color: CONFIG.colorMirrored });
+const lJointMeshes = JOINT_NAMES.map(() => { const m = new THREE.Mesh(jointGeo, lJointMat); m.visible = false; scene.add(m); return m; });
+const lBonePos = new Float32Array(boneIdx.length * 2 * 3);
+const lBoneGeo = new THREE.BufferGeometry();
+lBoneGeo.setAttribute('position', new THREE.BufferAttribute(lBonePos, 3));
+const lBones = new THREE.LineSegments(lBoneGeo, new THREE.LineBasicMaterial({ color: CONFIG.colorMirroredBone }));
+lBones.frustumCulled = false; lBones.visible = false; scene.add(lBones);
+
+function renderLeftArm() {
+  leftArmGroup.visible = mirrored.valid;
+  const L = mirrored.leftHandJoints;
+  for (let i = 0; i < L.length; i++) {
+    const m = lJointMeshes[i];
+    m.visible = mirrored.valid && L[i].generated;
+    if (m.visible) { m.position.copy(L[i].position); m.scale.setScalar(Math.max(tracked.rightHandJoints[i].radius, CONFIG.jointMinRadius)); }
+  }
+  let n = 0;
+  if (mirrored.valid) {
+    for (const [a, b] of boneIdx) {
+      if (L[a].generated && L[b].generated) { L[a].position.toArray(lBonePos, n * 3); n++; L[b].position.toArray(lBonePos, n * 3); n++; }
+    }
+  }
+  lBoneGeo.setDrawRange(0, n);
+  lBoneGeo.attributes.position.needsUpdate = true;
+  lBones.visible = n > 0;
+  if (!mirrored.valid) return;
+  lShoulderMesh.position.copy(mirrored.leftShoulder);
+  lElbowMesh.position.copy(mirrored.leftElbow);
+  placeBone(lUpperArmMesh, mirrored.leftShoulder, mirrored.leftElbow);
+  placeBone(lForearmMesh, mirrored.leftElbow, mirrored.leftWrist);
+}
+
 /* ========== デバッグ表示 (DOM + VR内HUD) ========== */
 function debugLines() {
   const mm = v => (v * 1000).toFixed(0);
@@ -326,7 +405,7 @@ function debugLines() {
     'Right wrist: TRACKED',
     `IK status: ${estimated.ikStatus}`,
     `Reach: ${mm(estimated.reachDist)} / ${mm(estimated.reachMax)} mm`,
-    'Virtual left arm: OFF',
+    `Virtual left arm: ${mirrored.valid ? 'ON (MIRRORED)' : 'OFF'}`,
   ];
 }
 const hudCanvas = document.createElement('canvas');
@@ -349,14 +428,14 @@ function updateDebug(dt) {
   if (hudT < 0.2) return;
   hudT = 0;
   const lines = debugLines();
-  panelEl.textContent = 'Mirror Arm - Phase 1B\n' + lines.join('\n');
+  panelEl.textContent = 'Mirror Arm - Phase 1C\n' + lines.join('\n');
   hudG.clearRect(0, 0, 512, 336);
   hudG.fillStyle = 'rgba(0,0,0,0.6)';
   hudG.fillRect(0, 0, 512, 336);
   hudG.font = 'bold 26px sans-serif';
   hudG.textBaseline = 'middle';
   lines.forEach((t, i) => {
-    hudG.fillStyle = t.includes('ESTIMATED') ? '#ffb060' : t.includes('TRACKED') && !t.includes('Right hand') && !t.includes('Right wrist tracked') && !t.includes('Tracked hand') ? '#7fd4ff' : '#ffffff';
+    hudG.fillStyle = t.includes('MIRRORED') ? '#8be88b' : t.includes('ESTIMATED') ? '#ffb060' : t.includes('TRACKED') && !t.includes('Right hand') && !t.includes('Right wrist tracked') && !t.includes('Tracked hand') ? '#7fd4ff' : '#ffffff';
     hudG.fillText(t, 18, 26 + i * 34);
   });
   hudTex.needsUpdate = true;
@@ -383,8 +462,10 @@ renderer.setAnimationLoop((time, frame) => {
     estimated.ikStatus = '--';
   }
 
+  updateMirror();
   renderRightHand();
   renderRightArm();
+  renderLeftArm();
   updateDebug(dt);
   renderer.render(scene, camera);
 });
