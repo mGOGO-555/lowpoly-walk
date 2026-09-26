@@ -28,6 +28,8 @@ Quest Browser で「ENTER VR」を押してください。</div>
 <script type="module">
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 
 /* ========== CONFIG ==========
    身体寸法は「一般的な値の仮置き」で、参加者の実測値ではありません。
@@ -53,8 +55,8 @@ const CONFIG = {
   // --- 表示色 ---
   colorTracked: 0x4fc3f7,     // TRACKED = 青
   colorTrackedBone: 0x2a8fc8,
-  colorEstimated: 0xffa040,   // ESTIMATED = オレンジ
-  colorMirrored: 0x66dd77,    // MIRRORED / GENERATED = 緑
+  colorEstimated: qs.get('debugcolors') === '1' ? 0xffa040 : 0xe8b898,  // 腕の色: 既定は肌色、?debugcolors=1 でオレンジ(ESTIMATED)   // ESTIMATED = オレンジ
+  colorMirrored: qs.get('debugcolors') === '1' ? 0x66dd77 : 0xe8b898,  // 仮想左腕の色: 既定は肌色、?debugcolors=1 で緑    // MIRRORED / GENERATED = 緑
   colorMirroredBone: 0x3aa64a,
   // --- 環境 (Phase 2): セッション開始時の身体の前方に配置 ---
   deskForward: num('dd', 0.45),                      // 肩の中央から机の中心までの前方距離
@@ -66,7 +68,11 @@ const CONFIG = {
   colorCube: 0xe53935,
   colorSkin: 0xe8b898,                               // 手の色 (肌色)
   showSkeleton: qs.get('skel') === '1',              // ?skel=1 でデバッグ用の骨格(球と線)も重ねて表示
-  showRightLimb: qs.get('right') === '1',            // 既定は右上肢を非表示 (追跡・推定・ミラーは継続)。?right=1 で右上肢も表示
+  rightMode: (() => { const r = qs.get('right'); return (r === 'live' || r === '1') ? 'live' : (r === 'off' || r === '0') ? 'off' : 'rest'; })(),
+  // 右上肢の表示: 'rest'(既定)=動かない右手を机上に休めて固定 / 'live'=実右手の動きを表示(確認用) / 'off'=非表示。?right=live など
+  restHandX: num('rx', 0.20),                        // 休めた右手の手首位置 (机の中心から右へ, m)
+  restHandY: num('ry', 0.022),                       // 机の上面からの高さ
+  restHandZ: num('rz', 0.22),                        // 机の中心から手前へ
   // --- pinch / grab (操作用の初期値。科学的に検証された閾値ではない) ---
   pinchOnThreshold: num('pn', 0.030),                // thumb-tip と index-tip の距離がこれ未満でON (m)
   pinchOffThreshold: num('pf', 0.045),               // これを超えたらOFF (ヒステリシス)
@@ -374,12 +380,15 @@ function placeBone(mesh, A, B) {
   mesh.visible = true;
 }
 function renderRightArm() {
-  armGroup.visible = estimated.valid;
-  if (!estimated.valid) return;
-  shoulderMesh.position.copy(estimated.rightShoulder);
-  elbowMesh.position.copy(estimated.rightElbow);
-  placeBone(upperArmMesh, estimated.rightShoulder, estimated.rightElbow);
-  placeBone(forearmMesh, estimated.rightElbow, estimated.ikTarget);
+  let A = null;                                          // 表示する右上肢 (rest: 休めた腕 / live: 実右手に追従する推定腕)
+  if (CONFIG.rightMode === 'live' && estimated.valid) A = { s: estimated.rightShoulder, e: estimated.rightElbow, w: estimated.ikTarget };
+  else if (CONFIG.rightMode === 'rest' && restArm.valid) A = { s: restArm.shoulder, e: restArm.elbow, w: restArm.wrist };
+  armGroup.visible = !!A;
+  if (!A) return;
+  shoulderMesh.position.copy(A.s);
+  elbowMesh.position.copy(A.e);
+  placeBone(upperArmMesh, A.s, A.e);
+  placeBone(forearmMesh, A.e, A.w);
 }
 
 // 仮想左上肢 (MIRRORED = 緑): 右と同じ構成
@@ -729,6 +738,141 @@ function renderPinchMarker() {
 }
 renderer.xr.addEventListener('sessionstart', () => { pinch.on = false; grab.active = false; env.cube.material.color.set(CONFIG.colorCube); });
 
+/* ==========================================================
+   RealisticHands: Meta/three.js公式例と同じ手モデル(glb)を使った、人に近い手
+   - 仮想左手 (MIRRORED): 実右手のモデルを、正中面の反射行列を持つ親(mirrorGroup)の下に置いて
+     鏡像として表示する。関節の向きも含めて正しく反転される。
+   - 休めた右手 (STATIC, 実測ではない): 同じモデルを、机の上に置いた姿勢のまま固定表示する。
+   ========================================================== */
+const HAND_PATH = 'https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/generic-hand/';
+const realistic = { ready: false, entries: [] };
+const mirrorGroup = new THREE.Group();
+mirrorGroup.matrixAutoUpdate = false;                  // 反射行列を毎フレーム直接設定する
+mirrorGroup.visible = false;
+scene.add(mirrorGroup);
+
+function setReflection(m, c, n) {                      // 点c・法線nの平面に関する反射
+  const k = 2 * c.dot(n);
+  m.set(
+    1 - 2 * n.x * n.x, -2 * n.x * n.y, -2 * n.x * n.z, k * n.x,
+    -2 * n.y * n.x, 1 - 2 * n.y * n.y, -2 * n.y * n.z, k * n.y,
+    -2 * n.z * n.x, -2 * n.z * n.y, 1 - 2 * n.z * n.z, k * n.z,
+    0, 0, 0, 1);
+}
+function tintSkinned(root) {                           // 手のモデルに肌色を付ける。モデルが読み込み済みならtrue
+  let found = false;
+  root.traverse(o => {
+    if (!o.isSkinnedMesh) return;
+    o.material = o.material.clone();
+    o.material.color.set(CONFIG.colorSkin);
+    if ('metalness' in o.material) { o.material.metalness = 0; o.material.roughness = 0.8; }
+    o.frustumCulled = false;
+    found = true;
+  });
+  return found;
+}
+async function setupMirroredHandModel() {
+  if (qs.get('hand') === 'procedural') return;
+  try { const r = await fetch(HAND_PATH + 'right.glb', { method: 'HEAD' }); if (!r.ok) return; } catch (e) { return; }
+  const factory = new XRHandModelFactory();
+  factory.setPath(HAND_PATH);
+  [0, 1].forEach(i => {
+    const h = renderer.xr.getHand(i);
+    const model = factory.createHandModel(h, 'mesh');
+    model.visible = false;                             // 右手のモデルだけを使う (左手のtrackingは使わない)
+    h.add(model);
+    h.addEventListener('connected', e => { h.userData.handedness = e.data.handedness; model.visible = e.data.handedness === 'right'; });
+    mirrorGroup.add(h);
+    realistic.entries.push({ h, model, tinted: false });
+  });
+}
+setupMirroredHandModel();
+
+// --- 休めた右手 ---
+const restWristLocal = new THREE.Vector3(CONFIG.restHandX, CONFIG.restHandY, CONFIG.restHandZ);   // 机のローカル座標
+const restHand = { holder: new THREE.Group(), ready: false };
+restHand.holder.visible = false;
+env.group.add(restHand.holder);
+function loadRestHand() {
+  if (qs.get('hand') === 'procedural') return;
+  new GLTFLoader().load(HAND_PATH + 'right.glb', gltf => {
+    const obj = gltf.scene;
+    obj.updateMatrixWorld(true);
+    const P = n => { const b = obj.getObjectByName(n); return b ? b.getWorldPosition(new THREE.Vector3()) : null; };
+    const w = P('wrist'), mid = P('middle-finger-phalanx-proximal'), imc = P('index-finger-metacarpal'), pmc = P('pinky-finger-metacarpal');
+    if (!w || !mid || !imc || !pmc) return;
+    // モデルの初期姿勢から手の座標系(親指側x, 手の甲y, 指先方向z)を作り、机の上に手のひらを下にして置く向きへそろえる
+    const z = mid.clone().sub(w).normalize();
+    const y = new THREE.Vector3().crossVectors(z, imc.clone().sub(pmc)).normalize();
+    const x = new THREE.Vector3().crossVectors(y, z);
+    const qRest = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(x, y, z));
+    const qTarget = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(new THREE.Vector3(-1, 0, 0), new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, -1)));
+    const qd = qTarget.multiply(qRest.invert());
+    restHand.holder.quaternion.copy(qd);
+    restHand.holder.position.copy(restWristLocal).sub(w.clone().applyQuaternion(qd));
+    tintSkinned(obj);
+    restHand.holder.add(obj);
+    restHand.ready = true;
+  }, undefined, err => console.warn('rest hand load failed', err));
+}
+loadRestHand();
+
+// --- 休めた右腕 (ESTIMATED / STATIC): 肩は推定、手首は机上の固定位置 ---
+const restArm = { valid: false, shoulder: new THREE.Vector3(), elbow: new THREE.Vector3(), wrist: new THREE.Vector3(), prevBend: new THREE.Vector3(), hasPrevBend: false };
+const _rw = new THREE.Vector3();
+function twoBoneIK(S, W, st, dt) {                    // solveRightArmIK と同じ手法 (肘の向きの連続性も維持)
+  const L1 = CONFIG.upperArmLength, L2 = CONFIG.forearmLength;
+  _d.subVectors(W, S);
+  const dist = _d.length();
+  if (!Number.isFinite(dist) || dist < 1e-6) return false;
+  _dir.copy(_d).divideScalar(dist);
+  const t = Math.min((L1 + L2) * CONFIG.ikReachMargin, Math.max(Math.abs(L1 - L2) + 0.01, dist));
+  st.wrist.copy(S).addScaledVector(_dir, t);
+  const a = (L1 * L1 - L2 * L2 + t * t) / (2 * t), h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  _P.copy(S).addScaledVector(_dir, a);
+  const pb = CONFIG.elbowPoleBody;
+  _pole.set(0, 0, 0).addScaledVector(body.right, pb.right).addScaledVector(body.up, pb.up).addScaledVector(body.forward, pb.forward).normalize();
+  _pv.copy(_pole).addScaledVector(_dir, -_pole.dot(_dir));
+  if (_pv.length() < 0.15) {
+    if (st.hasPrevBend) _pv.copy(st.prevBend); else _pv.copy(body.right);
+    _pv.addScaledVector(_dir, -_pv.dot(_dir));
+  }
+  if (_pv.lengthSq() < 1e-10) return false;
+  _pv.normalize();
+  if (st.hasPrevBend) {
+    _pp.copy(st.prevBend).addScaledVector(_dir, -st.prevBend.dot(_dir));
+    if (_pp.lengthSq() > 1e-6) {
+      _pp.normalize();
+      _pv.lerpVectors(_pp, _pv, 1 - Math.exp(-dt / CONFIG.ikBendSmoothingSec));
+      if (_pv.lengthSq() < 1e-6) _pv.copy(_pp);
+      _pv.normalize();
+    }
+  }
+  st.prevBend.copy(_pv); st.hasPrevBend = true;
+  st.elbow.copy(_P).addScaledVector(_pv, h);
+  return finite3(st.elbow) && finite3(st.wrist);
+}
+function updateRestArm(dt) {
+  restArm.valid = false;
+  if (CONFIG.rightMode !== 'rest' || !body.valid || !env.anchored) return;
+  restArm.shoulder.copy(body.shoulderCenter).addScaledVector(body.right, CONFIG.shoulderWidth / 2);
+  _rw.copy(restWristLocal);
+  env.group.localToWorld(_rw);
+  restArm.valid = twoBoneIK(restArm.shoulder, _rw, restArm, dt);
+}
+
+function updateRealisticHands() {
+  for (const e of realistic.entries) {                 // 右手のモデルが読み込まれたら肌色にして「使用可能」とする
+    if (e.tinted || e.h.userData.handedness !== 'right') continue;
+    if (tintSkinned(e.model)) { e.tinted = true; realistic.ready = true; }
+  }
+  const showMirror = realistic.ready && body.valid && tracked.rightHandTracking && mirrored.valid;
+  mirrorGroup.visible = showMirror;
+  if (showMirror) { setReflection(mirrorGroup.matrix, body.shoulderCenter, body.right); mirrorGroup.matrixWorldNeedsUpdate = true; }
+  restHand.holder.visible = restHand.ready && CONFIG.rightMode === 'rest' && env.anchored;
+}
+
 /* ========== メインループ ========== */
 const clock = new THREE.Clock();
 renderer.setAnimationLoop((time, frame) => {
@@ -737,6 +881,7 @@ renderer.setAnimationLoop((time, frame) => {
 
   updateBody(dt);
   anchorEnvironment();
+  updateRestArm(dt);
   estimated.valid = false;
   if (body.valid && tracked.rightWristTracked) {
     estimateRightShoulder();
@@ -755,9 +900,9 @@ renderer.setAnimationLoop((time, frame) => {
   renderRightHand();
   renderRightArm();
   renderLeftArm();
-  rightHandMesh.update(CONFIG.showRightLimb && tracked.rightHandTracking, tracked.rightHandJoints, 'tracked');
-  if (!CONFIG.showRightLimb) armGroup.visible = false;   // 右肩〜右前腕も非表示 (計算はミラー生成のため継続)
-  leftHandMesh.update(mirrored.valid, mirrored.leftHandJoints, 'generated');
+  rightHandMesh.update(CONFIG.rightMode === 'live' && tracked.rightHandTracking, tracked.rightHandJoints, 'tracked');
+  leftHandMesh.update(mirrored.valid && !realistic.ready, mirrored.leftHandJoints, 'generated');   // 手モデルが使えないときだけ簡易表示
+  updateRealisticHands();
   if (!CONFIG.showSkeleton) {                          // 既定では球と線の骨格は隠し、手の形だけを見せる
     jointMeshes.forEach(m => { m.visible = false; }); bones.visible = false;
     lJointMeshes.forEach(m => { m.visible = false; }); lBones.visible = false;
