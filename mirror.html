@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirror Arm - Phase 1A</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #202428; font-family: sans-serif; }
+  #panel {
+    position: fixed; top: 12px; left: 12px; padding: 10px 14px; border-radius: 10px;
+    background: rgba(20, 20, 26, 0.75); color: #eee; font-size: 12px; line-height: 1.6; white-space: pre;
+  }
+</style>
+</head>
+<body>
+<div id="panel">Mirror Arm - Phase 1A (right hand tracking)
+Quest Browser で「ENTER VR」を押してください。</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+/* ========== CONFIG (後のPhaseで肩幅・腕長・IK設定などを追加) ========== */
+const CONFIG = {
+  jointMinRadius: 0.004,    // 表示用の最小球半径 (m)
+  jointColor: 0x4fc3f7,     // TRACKED = 青
+  boneColor: 0x9ad8ff,
+};
+
+/* ========== WebXR Hand Input の25関節 ========== */
+const FINGERS = {
+  thumb: ['metacarpal', 'phalanx-proximal', 'phalanx-distal', 'tip'],
+  'index-finger': ['metacarpal', 'phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'],
+  'middle-finger': ['metacarpal', 'phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'],
+  'ring-finger': ['metacarpal', 'phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'],
+  'pinky-finger': ['metacarpal', 'phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'],
+};
+const JOINT_NAMES = ['wrist'];
+const BONE_PAIRS = [];
+for (const [finger, parts] of Object.entries(FINGERS)) {
+  let prev = 'wrist';
+  for (const p of parts) {
+    const name = `${finger}-${p}`;
+    JOINT_NAMES.push(name);
+    BONE_PAIRS.push([prev, name]);
+    prev = name;
+  }
+}
+// JOINT_NAMES.length === 25
+
+/* ========== TRACKED: WebXRから直接取得した実測値のみを入れる ========== */
+const tracked = {
+  rightHandTracking: false,
+  rightWristTracked: false,
+  trackedJointCount: 0,
+  rightHandJoints: JOINT_NAMES.map(name => ({ name, tracked: false, position: new THREE.Vector3(), radius: 0 })),
+};
+function clearTracked() {
+  tracked.rightHandTracking = false;
+  tracked.rightWristTracked = false;
+  tracked.trackedJointCount = 0;
+  for (const j of tracked.rightHandJoints) j.tracked = false;
+}
+
+/* ========== シーン ========== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202428);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 50);
+camera.position.set(0, 1.6, 0);
+scene.add(camera);
+scene.add(new THREE.GridHelper(4, 16, 0x556677, 0x334455));
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 2));
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));   // r160の既定で hand-tracking を optionalFeatures に含む
+
+/* ========== 右手の骨格表示 (trackedの内容をそのまま描くだけ) ========== */
+const jointGeo = new THREE.SphereGeometry(1, 10, 8);
+const jointMat = new THREE.MeshBasicMaterial({ color: CONFIG.jointColor });
+const jointMeshes = JOINT_NAMES.map(() => {
+  const m = new THREE.Mesh(jointGeo, jointMat);
+  m.visible = false;
+  scene.add(m);
+  return m;
+});
+const boneIdx = BONE_PAIRS.map(([a, b]) => [JOINT_NAMES.indexOf(a), JOINT_NAMES.indexOf(b)]);
+const bonePos = new Float32Array(boneIdx.length * 2 * 3);
+const boneGeo = new THREE.BufferGeometry();
+boneGeo.setAttribute('position', new THREE.BufferAttribute(bonePos, 3));
+const bones = new THREE.LineSegments(boneGeo, new THREE.LineBasicMaterial({ color: CONFIG.boneColor }));
+bones.frustumCulled = false;
+bones.visible = false;
+scene.add(bones);
+
+function renderRightHand() {
+  const J = tracked.rightHandJoints;
+  for (let i = 0; i < J.length; i++) {
+    const m = jointMeshes[i];
+    m.visible = J[i].tracked;
+    if (J[i].tracked) {
+      m.position.copy(J[i].position);
+      m.scale.setScalar(Math.max(J[i].radius, CONFIG.jointMinRadius));
+    }
+  }
+  let n = 0;
+  for (const [a, b] of boneIdx) {
+    if (J[a].tracked && J[b].tracked) {
+      J[a].position.toArray(bonePos, n * 3); n++;
+      J[b].position.toArray(bonePos, n * 3); n++;
+    }
+  }
+  boneGeo.setDrawRange(0, n);
+  boneGeo.attributes.position.needsUpdate = true;
+  bones.visible = n > 0;
+}
+
+/* ========== 右手のみを取得 (左手はここで無視) ========== */
+function updateTracked(frame) {
+  clearTracked();
+  const session = renderer.xr.getSession && renderer.xr.getSession();
+  const ref = renderer.xr.getReferenceSpace && renderer.xr.getReferenceSpace();
+  if (!frame || !session || !ref) return;
+  let hand = null;
+  for (const src of session.inputSources) {
+    if (src.handedness === 'right' && src.hand) { hand = src.hand; break; }
+  }
+  if (!hand) return;
+  tracked.rightHandTracking = true;
+  for (let i = 0; i < JOINT_NAMES.length; i++) {
+    const js = hand.get(JOINT_NAMES[i]);
+    const pose = js ? frame.getJointPose(js, ref) : null;
+    const j = tracked.rightHandJoints[i];
+    if (!pose) continue;
+    const p = pose.transform.position;
+    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) continue;   // NaNを渡さない
+    j.position.set(p.x, p.y, p.z);
+    j.radius = pose.radius || 0;
+    j.tracked = true;
+    tracked.trackedJointCount++;
+  }
+  tracked.rightWristTracked = tracked.rightHandJoints[0].tracked;
+  if (tracked.trackedJointCount === 0) tracked.rightHandTracking = false;
+}
+
+/* ========== デバッグ表示 (DOM + VR内HUD) ========== */
+function debugText() {
+  return [
+    `Right hand tracking: ${tracked.rightHandTracking ? 'ON' : 'OFF'}`,
+    `Wrist pose: ${tracked.rightWristTracked ? 'available' : 'not available'}`,
+    `Tracked joints: ${tracked.trackedJointCount}/25`,
+  ];
+}
+const hudCanvas = document.createElement('canvas');
+hudCanvas.width = 512; hudCanvas.height = 192;
+const hudG = hudCanvas.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hudCanvas);
+hudTex.colorSpace = THREE.SRGBColorSpace;
+const hudMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(0.4, 0.15),
+  new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false })
+);
+hudMesh.position.set(-0.3, -0.22, -0.9);
+hudMesh.renderOrder = 999;
+camera.add(hudMesh);
+
+const panelEl = document.getElementById('panel');
+let hudT = 0;
+function updateDebug(dt) {
+  hudT += dt;
+  if (hudT < 0.2) return;
+  hudT = 0;
+  const lines = debugText();
+  panelEl.textContent = 'Mirror Arm - Phase 1A\n' + lines.join('\n');
+  hudG.clearRect(0, 0, 512, 192);
+  hudG.fillStyle = 'rgba(0,0,0,0.6)';
+  hudG.fillRect(0, 0, 512, 192);
+  hudG.font = 'bold 32px sans-serif';
+  hudG.fillStyle = '#ffffff';
+  hudG.textBaseline = 'middle';
+  lines.forEach((t, i) => hudG.fillText(t, 20, 36 + i * 56));
+  hudTex.needsUpdate = true;
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ========== メインループ ========== */
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((time, frame) => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (renderer.xr.isPresenting) updateTracked(frame); else clearTracked();
+  renderRightHand();
+  updateDebug(dt);
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
