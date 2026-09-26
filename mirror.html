@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mirror Arm - Phase 1A</title>
+<title>Mirror Arm - Phase 1B</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #202428; font-family: sans-serif; }
   #panel {
@@ -13,7 +13,7 @@
 </style>
 </head>
 <body>
-<div id="panel">Mirror Arm - Phase 1A (right hand tracking)
+<div id="panel">Mirror Arm - Phase 1B (right arm)
 Quest Browser で「ENTER VR」を押してください。</div>
 
 <script type="importmap">
@@ -29,11 +29,28 @@ Quest Browser で「ENTER VR」を押してください。</div>
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 
-/* ========== CONFIG (後のPhaseで肩幅・腕長・IK設定などを追加) ========== */
+/* ========== CONFIG ==========
+   身体寸法は「一般的な値の仮置き」で、参加者の実測値ではありません。
+   URLで一時的に変更できます: ?sw=0.36&vo=0.22&po=0.08&ua=0.30&fa=0.27 (単位 m) */
+const qs = new URLSearchParams(location.search);
+const num = (k, d) => { const v = parseFloat(qs.get(k)); return Number.isFinite(v) ? v : d; };
 const CONFIG = {
-  jointMinRadius: 0.004,    // 表示用の最小球半径 (m)
-  jointColor: 0x4fc3f7,     // TRACKED = 青
-  boneColor: 0x9ad8ff,
+  jointMinRadius: 0.004,
+  // --- 身体寸法 (ESTIMATED用の仮置き値) ---
+  shoulderWidth: num('sw', 0.36),                    // 左右の肩の間隔
+  headToShoulderVerticalOffset: num('vo', 0.22),     // 頭(両眼中間)から肩までの下方向の距離
+  headToShoulderPosteriorOffset: num('po', 0.08),    // 頭から肩までの後方向の距離
+  upperArmLength: num('ua', 0.30),
+  forearmLength: num('fa', 0.27),                    // 肘〜手首
+  // --- 肘の曲がる向き (身体座標: 右+, 上+, 前+)。外側・下・やや後方 ---
+  elbowPoleBody: { right: 0.5, up: -0.8, forward: -0.3 },
+  bodyYawSmoothingSec: 0.25,                         // 身体向き(yaw)の平滑化
+  ikReachMargin: 0.999,
+  ikBendSmoothingSec: 0.05,                          // 肘の向きの連続性 (急な切り替え防止)
+  // --- 表示色 ---
+  colorTracked: 0x4fc3f7,     // TRACKED = 青
+  colorTrackedBone: 0x9ad8ff,
+  colorEstimated: 0xffa040,   // ESTIMATED = オレンジ
 };
 
 /* ========== WebXR Hand Input の25関節 ========== */
@@ -55,20 +72,173 @@ for (const [finger, parts] of Object.entries(FINGERS)) {
     prev = name;
   }
 }
-// JOINT_NAMES.length === 25
 
-/* ========== TRACKED: WebXRから直接取得した実測値のみを入れる ========== */
+/* ==========================================================
+   TRACKED: WebXRから直接取得した実測値のみ
+   ========================================================== */
 const tracked = {
+  headPoseValid: false,
+  headPosition: new THREE.Vector3(),
+  headQuaternion: new THREE.Quaternion(),
   rightHandTracking: false,
   rightWristTracked: false,
   trackedJointCount: 0,
   rightHandJoints: JOINT_NAMES.map(name => ({ name, tracked: false, position: new THREE.Vector3(), radius: 0 })),
 };
 function clearTracked() {
+  tracked.headPoseValid = false;
   tracked.rightHandTracking = false;
   tracked.rightWristTracked = false;
   tracked.trackedJointCount = 0;
   for (const j of tracked.rightHandJoints) j.tracked = false;
+}
+const finite3 = p => Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z);
+
+function updateTracked(frame) {
+  clearTracked();
+  const session = renderer.xr.getSession && renderer.xr.getSession();
+  const ref = renderer.xr.getReferenceSpace && renderer.xr.getReferenceSpace();
+  if (!frame || !session || !ref) return;
+
+  // HMD pose (viewer pose)
+  const vp = frame.getViewerPose(ref);
+  if (vp) {
+    const p = vp.transform.position, o = vp.transform.orientation;
+    if (finite3(p) && [o.x, o.y, o.z, o.w].every(Number.isFinite)) {
+      tracked.headPosition.set(p.x, p.y, p.z);
+      tracked.headQuaternion.set(o.x, o.y, o.z, o.w);
+      tracked.headPoseValid = true;
+    }
+  }
+
+  // 右手のみ (左手は使用しない)
+  let hand = null;
+  for (const src of session.inputSources) {
+    if (src.handedness === 'right' && src.hand) { hand = src.hand; break; }
+  }
+  if (!hand) return;
+  tracked.rightHandTracking = true;
+  for (let i = 0; i < JOINT_NAMES.length; i++) {
+    const js = hand.get(JOINT_NAMES[i]);
+    const pose = js ? frame.getJointPose(js, ref) : null;
+    const j = tracked.rightHandJoints[i];
+    if (!pose) continue;
+    const p = pose.transform.position;
+    if (!finite3(p)) continue;
+    j.position.set(p.x, p.y, p.z);
+    j.radius = pose.radius || 0;
+    j.tracked = true;
+    tracked.trackedJointCount++;
+  }
+  tracked.rightWristTracked = tracked.rightHandJoints[0].tracked;
+  if (tracked.trackedJointCount === 0) tracked.rightHandTracking = false;
+}
+
+/* ==========================================================
+   BodyReference: HMDのyawから身体座標系を推定 (ESTIMATED)
+   pitch/rollは使わない。身体の左右軸=正中面の法線。
+   ========================================================== */
+const body = {
+  valid: false,
+  yaw: 0, yawInit: false,
+  forward: new THREE.Vector3(0, 0, -1),
+  right: new THREE.Vector3(1, 0, 0),
+  up: new THREE.Vector3(0, 1, 0),
+  shoulderCenter: new THREE.Vector3(),   // ESTIMATED
+};
+const _f = new THREE.Vector3(), _u = new THREE.Vector3();
+const wrapPi = a => Math.atan2(Math.sin(a), Math.cos(a));
+function updateBody(dt) {
+  if (!tracked.headPoseValid) { body.valid = false; return; }
+  _f.set(0, 0, -1).applyQuaternion(tracked.headQuaternion);
+  _u.set(0, 1, 0).applyQuaternion(tracked.headQuaternion);
+  let fx = _f.x, fz = _f.z, hl = Math.hypot(fx, fz);
+  if (hl < 0.35) {                       // 真上/真下を向いたときは頭のup方向で向きを取る
+    const s = _f.y < 0 ? 1 : -1;
+    fx = _u.x * s; fz = _u.z * s; hl = Math.hypot(fx, fz);
+  }
+  if (hl > 0.05) {
+    const target = Math.atan2(fx, -fz);
+    if (!body.yawInit) { body.yaw = target; body.yawInit = true; }
+    else body.yaw = wrapPi(body.yaw + wrapPi(target - body.yaw) * (1 - Math.exp(-dt / CONFIG.bodyYawSmoothingSec)));
+  }
+  body.forward.set(Math.sin(body.yaw), 0, -Math.cos(body.yaw));
+  body.up.set(0, 1, 0);
+  body.right.crossVectors(body.forward, body.up).normalize();
+  body.shoulderCenter.copy(tracked.headPosition)
+    .addScaledVector(body.forward, -CONFIG.headToShoulderPosteriorOffset)
+    .addScaledVector(body.up, -CONFIG.headToShoulderVerticalOffset);
+  body.valid = body.shoulderCenter.toArray().every(Number.isFinite);
+}
+
+/* ==========================================================
+   ESTIMATED: 肩・肘 (実測値ではない)
+   ========================================================== */
+const estimated = {
+  valid: false,
+  rightShoulder: new THREE.Vector3(),
+  rightElbow: new THREE.Vector3(),
+  ikTarget: new THREE.Vector3(),      // 表示用IK目標 (trackedの手首は書き換えない)
+  ikStatus: '--',
+  reachDist: 0, reachMax: 0,
+  prevBend: new THREE.Vector3(), hasPrevBend: false,
+};
+const _d = new THREE.Vector3(), _dir = new THREE.Vector3(), _pole = new THREE.Vector3();
+const _pv = new THREE.Vector3(), _pp = new THREE.Vector3(), _P = new THREE.Vector3();
+
+function estimateRightShoulder() {
+  estimated.rightShoulder.copy(body.shoulderCenter).addScaledVector(body.right, CONFIG.shoulderWidth / 2);
+}
+
+// ArmIK: two-bone IK。肘の向きはpole(身体座標で指定)と前フレームの連続性で決める
+function solveRightArmIK(dt) {
+  const S = estimated.rightShoulder;
+  const W = tracked.rightHandJoints[0].position;      // 読み取りのみ
+  const L1 = CONFIG.upperArmLength, L2 = CONFIG.forearmLength;
+  _d.subVectors(W, S);
+  const dist = _d.length();
+  estimated.reachDist = dist;
+  estimated.reachMax = L1 + L2;
+  if (!Number.isFinite(dist) || dist < 1e-6) { estimated.ikStatus = 'ERROR'; return false; }
+  _dir.copy(_d).divideScalar(dist);
+
+  const maxR = (L1 + L2) * CONFIG.ikReachMargin, minR = Math.abs(L1 - L2) + 0.01;
+  let status = 'OK', t = dist;
+  if (t > maxR) { t = maxR; status = 'CLAMPED'; }
+  else if (t < minR) { t = minR; status = 'CLAMPED'; }
+  estimated.ikTarget.copy(S).addScaledVector(_dir, t);
+
+  const a = (L1 * L1 - L2 * L2 + t * t) / (2 * t);
+  const h = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  _P.copy(S).addScaledVector(_dir, a);
+
+  const pb = CONFIG.elbowPoleBody;
+  _pole.set(0, 0, 0)
+    .addScaledVector(body.right, pb.right).addScaledVector(body.up, pb.up).addScaledVector(body.forward, pb.forward)
+    .normalize();
+  _pv.copy(_pole).addScaledVector(_dir, -_pole.dot(_dir));          // 腕の軸に直交する成分
+  if (_pv.length() < 0.15) {                                        // poleが腕の軸とほぼ平行 → 前フレームの向きを使う
+    if (estimated.hasPrevBend) _pv.copy(estimated.prevBend); else _pv.copy(body.right);
+    _pv.addScaledVector(_dir, -_pv.dot(_dir));
+  }
+  if (_pv.lengthSq() < 1e-10) { estimated.ikStatus = 'ERROR'; return false; }
+  _pv.normalize();
+  if (estimated.hasPrevBend) {                                      // 連続性: 前フレームの向きへ滑らかに
+    _pp.copy(estimated.prevBend).addScaledVector(_dir, -estimated.prevBend.dot(_dir));
+    if (_pp.lengthSq() > 1e-6) {
+      _pp.normalize();
+      const k = 1 - Math.exp(-dt / CONFIG.ikBendSmoothingSec);
+      _pv.lerpVectors(_pp, _pv, k);
+      if (_pv.lengthSq() < 1e-6) _pv.copy(_pp);
+      _pv.normalize();
+    }
+  }
+  estimated.prevBend.copy(_pv); estimated.hasPrevBend = true;
+
+  estimated.rightElbow.copy(_P).addScaledVector(_pv, h);
+  if (!finite3(estimated.rightElbow) || !finite3(estimated.ikTarget)) { estimated.ikStatus = 'ERROR'; return false; }
+  estimated.ikStatus = status;
+  return true;
 }
 
 /* ========== シーン ========== */
@@ -85,94 +255,90 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.xr.enabled = true;
 document.body.appendChild(renderer.domElement);
-document.body.appendChild(VRButton.createButton(renderer));   // r160の既定で hand-tracking を optionalFeatures に含む
+document.body.appendChild(VRButton.createButton(renderer));
 
-/* ========== 右手の骨格表示 (trackedの内容をそのまま描くだけ) ========== */
+/* ========== ArmRenderer ========== */
+// 右手の骨格 (TRACKED = 青)
 const jointGeo = new THREE.SphereGeometry(1, 10, 8);
-const jointMat = new THREE.MeshBasicMaterial({ color: CONFIG.jointColor });
-const jointMeshes = JOINT_NAMES.map(() => {
-  const m = new THREE.Mesh(jointGeo, jointMat);
-  m.visible = false;
-  scene.add(m);
-  return m;
-});
+const jointMat = new THREE.MeshBasicMaterial({ color: CONFIG.colorTracked });
+const jointMeshes = JOINT_NAMES.map(() => { const m = new THREE.Mesh(jointGeo, jointMat); m.visible = false; scene.add(m); return m; });
 const boneIdx = BONE_PAIRS.map(([a, b]) => [JOINT_NAMES.indexOf(a), JOINT_NAMES.indexOf(b)]);
 const bonePos = new Float32Array(boneIdx.length * 2 * 3);
 const boneGeo = new THREE.BufferGeometry();
 boneGeo.setAttribute('position', new THREE.BufferAttribute(bonePos, 3));
-const bones = new THREE.LineSegments(boneGeo, new THREE.LineBasicMaterial({ color: CONFIG.boneColor }));
-bones.frustumCulled = false;
-bones.visible = false;
-scene.add(bones);
+const bones = new THREE.LineSegments(boneGeo, new THREE.LineBasicMaterial({ color: CONFIG.colorTrackedBone }));
+bones.frustumCulled = false; bones.visible = false; scene.add(bones);
 
 function renderRightHand() {
   const J = tracked.rightHandJoints;
   for (let i = 0; i < J.length; i++) {
     const m = jointMeshes[i];
     m.visible = J[i].tracked;
-    if (J[i].tracked) {
-      m.position.copy(J[i].position);
-      m.scale.setScalar(Math.max(J[i].radius, CONFIG.jointMinRadius));
-    }
+    if (J[i].tracked) { m.position.copy(J[i].position); m.scale.setScalar(Math.max(J[i].radius, CONFIG.jointMinRadius)); }
   }
   let n = 0;
   for (const [a, b] of boneIdx) {
-    if (J[a].tracked && J[b].tracked) {
-      J[a].position.toArray(bonePos, n * 3); n++;
-      J[b].position.toArray(bonePos, n * 3); n++;
-    }
+    if (J[a].tracked && J[b].tracked) { J[a].position.toArray(bonePos, n * 3); n++; J[b].position.toArray(bonePos, n * 3); n++; }
   }
   boneGeo.setDrawRange(0, n);
   boneGeo.attributes.position.needsUpdate = true;
   bones.visible = n > 0;
 }
 
-/* ========== 右手のみを取得 (左手はここで無視) ========== */
-function updateTracked(frame) {
-  clearTracked();
-  const session = renderer.xr.getSession && renderer.xr.getSession();
-  const ref = renderer.xr.getReferenceSpace && renderer.xr.getReferenceSpace();
-  if (!frame || !session || !ref) return;
-  let hand = null;
-  for (const src of session.inputSources) {
-    if (src.handedness === 'right' && src.hand) { hand = src.hand; break; }
-  }
-  if (!hand) return;
-  tracked.rightHandTracking = true;
-  for (let i = 0; i < JOINT_NAMES.length; i++) {
-    const js = hand.get(JOINT_NAMES[i]);
-    const pose = js ? frame.getJointPose(js, ref) : null;
-    const j = tracked.rightHandJoints[i];
-    if (!pose) continue;
-    const p = pose.transform.position;
-    if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) continue;   // NaNを渡さない
-    j.position.set(p.x, p.y, p.z);
-    j.radius = pose.radius || 0;
-    j.tracked = true;
-    tracked.trackedJointCount++;
-  }
-  tracked.rightWristTracked = tracked.rightHandJoints[0].tracked;
-  if (tracked.trackedJointCount === 0) tracked.rightHandTracking = false;
+// 右上肢 (ESTIMATED = オレンジ): 肩・肘の球、上腕・前腕の円柱
+const estMat = new THREE.MeshLambertMaterial({ color: CONFIG.colorEstimated });
+const shoulderMesh = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), estMat);
+const elbowMesh = new THREE.Mesh(new THREE.SphereGeometry(0.03, 16, 12), estMat);
+const upperArmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1, 12), estMat);
+const forearmMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 1, 12), estMat);
+const armGroup = new THREE.Group();
+armGroup.add(shoulderMesh, elbowMesh, upperArmMesh, forearmMesh);
+armGroup.visible = false;
+scene.add(armGroup);
+const Y_AXIS = new THREE.Vector3(0, 1, 0), _bd = new THREE.Vector3();
+function placeBone(mesh, A, B) {
+  _bd.subVectors(B, A);
+  const len = _bd.length();
+  if (!(len > 1e-6)) { mesh.visible = false; return; }
+  mesh.position.copy(A).addScaledVector(_bd, 0.5);
+  mesh.quaternion.setFromUnitVectors(Y_AXIS, _bd.divideScalar(len));
+  mesh.scale.set(1, len, 1);
+  mesh.visible = true;
+}
+function renderRightArm() {
+  armGroup.visible = estimated.valid;
+  if (!estimated.valid) return;
+  shoulderMesh.position.copy(estimated.rightShoulder);
+  elbowMesh.position.copy(estimated.rightElbow);
+  placeBone(upperArmMesh, estimated.rightShoulder, estimated.rightElbow);
+  placeBone(forearmMesh, estimated.rightElbow, estimated.ikTarget);
 }
 
 /* ========== デバッグ表示 (DOM + VR内HUD) ========== */
-function debugText() {
+function debugLines() {
+  const mm = v => (v * 1000).toFixed(0);
   return [
     `Right hand tracking: ${tracked.rightHandTracking ? 'ON' : 'OFF'}`,
-    `Wrist pose: ${tracked.rightWristTracked ? 'available' : 'not available'}`,
-    `Tracked joints: ${tracked.trackedJointCount}/25`,
+    `Right wrist tracked: ${tracked.rightWristTracked ? 'YES' : 'NO'}`,
+    `Tracked hand joints: ${tracked.trackedJointCount} / 25`,
+    'Right shoulder: ESTIMATED',
+    'Right elbow: ESTIMATED',
+    'Right wrist: TRACKED',
+    `IK status: ${estimated.ikStatus}`,
+    `Reach: ${mm(estimated.reachDist)} / ${mm(estimated.reachMax)} mm`,
+    'Virtual left arm: OFF',
   ];
 }
 const hudCanvas = document.createElement('canvas');
-hudCanvas.width = 512; hudCanvas.height = 192;
+hudCanvas.width = 512; hudCanvas.height = 336;
 const hudG = hudCanvas.getContext('2d');
 const hudTex = new THREE.CanvasTexture(hudCanvas);
 hudTex.colorSpace = THREE.SRGBColorSpace;
 const hudMesh = new THREE.Mesh(
-  new THREE.PlaneGeometry(0.4, 0.15),
+  new THREE.PlaneGeometry(0.4, 0.2625),
   new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthTest: false, depthWrite: false, toneMapped: false })
 );
-hudMesh.position.set(-0.3, -0.22, -0.9);
+hudMesh.position.set(-0.3, -0.25, -0.9);
 hudMesh.renderOrder = 999;
 camera.add(hudMesh);
 
@@ -182,15 +348,17 @@ function updateDebug(dt) {
   hudT += dt;
   if (hudT < 0.2) return;
   hudT = 0;
-  const lines = debugText();
-  panelEl.textContent = 'Mirror Arm - Phase 1A\n' + lines.join('\n');
-  hudG.clearRect(0, 0, 512, 192);
+  const lines = debugLines();
+  panelEl.textContent = 'Mirror Arm - Phase 1B\n' + lines.join('\n');
+  hudG.clearRect(0, 0, 512, 336);
   hudG.fillStyle = 'rgba(0,0,0,0.6)';
-  hudG.fillRect(0, 0, 512, 192);
-  hudG.font = 'bold 32px sans-serif';
-  hudG.fillStyle = '#ffffff';
+  hudG.fillRect(0, 0, 512, 336);
+  hudG.font = 'bold 26px sans-serif';
   hudG.textBaseline = 'middle';
-  lines.forEach((t, i) => hudG.fillText(t, 20, 36 + i * 56));
+  lines.forEach((t, i) => {
+    hudG.fillStyle = t.includes('ESTIMATED') ? '#ffb060' : t.includes('TRACKED') && !t.includes('Right hand') && !t.includes('Right wrist tracked') && !t.includes('Tracked hand') ? '#7fd4ff' : '#ffffff';
+    hudG.fillText(t, 18, 26 + i * 34);
+  });
   hudTex.needsUpdate = true;
 }
 
@@ -205,7 +373,18 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(clock.getDelta(), 0.1);
   if (renderer.xr.isPresenting) updateTracked(frame); else clearTracked();
+
+  updateBody(dt);
+  estimated.valid = false;
+  if (body.valid && tracked.rightWristTracked) {
+    estimateRightShoulder();
+    estimated.valid = solveRightArmIK(dt);
+  } else {
+    estimated.ikStatus = '--';
+  }
+
   renderRightHand();
+  renderRightArm();
   updateDebug(dt);
   renderer.render(scene, camera);
 });
