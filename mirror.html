@@ -64,6 +64,9 @@ const CONFIG = {
   cubeLocalX: -0.18,                                 // 机中心から左方向 (仮想左手の側)
   cubeLocalZ: 0.07,                                  // 机中心より手前
   colorCube: 0xe53935,
+  colorSkin: 0xe8b898,                               // 手の色 (肌色)
+  showSkeleton: qs.get('skel') === '1',              // ?skel=1 でデバッグ用の骨格(球と線)も重ねて表示
+  showRightLimb: qs.get('right') === '1',            // 既定は右上肢を非表示 (追跡・推定・ミラーは継続)。?right=1 で右上肢も表示
   // --- pinch / grab (操作用の初期値。科学的に検証された閾値ではない) ---
   pinchOnThreshold: num('pn', 0.030),                // thumb-tip と index-tip の距離がこれ未満でON (m)
   pinchOffThreshold: num('pf', 0.045),               // これを超えたらOFF (ヒステリシス)
@@ -421,6 +424,81 @@ function renderLeftArm() {
   placeBone(lForearmMesh, mirrored.leftElbow, mirrored.leftWrist);
 }
 
+/* ==========================================================
+   HandMesh: 人の手に近い表示 (関節位置から生成)
+   指=先細りの円柱+関節球、手のひら=厚みのある面。TRACKED/MIRRORED どちらの手にも使う。
+   関節の向き(quaternion)は使わず、位置だけで作るので、反転した手でも破綻しない。
+   ========================================================== */
+const skinMat = new THREE.MeshLambertMaterial({ color: CONFIG.colorSkin, side: THREE.DoubleSide });
+const unitSphere = new THREE.SphereGeometry(1, 14, 10);
+const FINGER_RADIUS = { thumb: 0.0105, 'index-finger': 0.0090, 'middle-finger': 0.0092, 'ring-finger': 0.0085, 'pinky-finger': 0.0075 };
+const PALM_HALF = 0.010;                                 // 手のひらの厚みの半分 (m)
+const jn = n => JOINT_NAMES.indexOf(n);
+function makeHandMesh() {
+  const group = new THREE.Group();
+  group.visible = false;
+  scene.add(group);
+  const spheres = [], segs = [];
+  const addSphere = (ji, r) => { const m = new THREE.Mesh(unitSphere, skinMat); m.scale.setScalar(r); group.add(m); spheres.push({ ji, m }); };
+  for (const [finger, r0] of Object.entries(FINGER_RADIUS)) {
+    const thumb = finger === 'thumb';
+    const names = thumb ? ['metacarpal', 'phalanx-proximal', 'phalanx-distal', 'tip'] : ['phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'];
+    const k = thumb ? [1.1, 1, 0.85, 0.75] : [1, 0.9, 0.8, 0.72];
+    const idx = names.map(n => jn(`${finger}-${n}`));
+    idx.forEach((ji, i) => addSphere(ji, r0 * k[i]));
+    for (let i = 0; i < idx.length - 1; i++) {
+      const m = new THREE.Mesh(new THREE.CylinderGeometry(r0 * k[i + 1], r0 * k[i], 1, 10, 1, true), skinMat);
+      group.add(m); segs.push({ a: idx[i], b: idx[i + 1], m });
+    }
+  }
+  addSphere(0, 0.024);                                   // 手首
+
+  // 手のひら: 外周の点 + 中心から扇状に張った面を、法線方向に±厚み分ずらして上下2枚 + 側面
+  const ringIdx = [0, jn('thumb-metacarpal'), jn('thumb-phalanx-proximal'), jn('index-finger-phalanx-proximal'),
+    jn('middle-finger-phalanx-proximal'), jn('ring-finger-phalanx-proximal'), jn('pinky-finger-phalanx-proximal'), jn('pinky-finger-metacarpal')];
+  const centerIdx = [jn('middle-finger-metacarpal'), jn('ring-finger-metacarpal'), jn('middle-finger-phalanx-proximal'), jn('ring-finger-phalanx-proximal')];
+  const N = ringIdx.length;
+  const T = i => i, B = i => i + N + 1;                  // 上面: 0..N (Nが中心) / 下面: N+1..2N+1
+  const indices = [];
+  for (let i = 0; i < N; i++) {
+    const j = (i + 1) % N;
+    indices.push(N, T(i), T(j), B(N), B(i), B(j));
+    indices.push(T(i), T(j), B(j), T(i), B(j), B(i));
+  }
+  const posArr = new Float32Array((N + 1) * 2 * 3);
+  const palmGeo = new THREE.BufferGeometry();
+  palmGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+  palmGeo.setIndex(indices);
+  const palm = new THREE.Mesh(palmGeo, skinMat);
+  palm.frustumCulled = false; palm.visible = false;
+  group.add(palm);
+
+  const c = new THREE.Vector3(), n = new THREE.Vector3(), t1 = new THREE.Vector3(), t2 = new THREE.Vector3();
+  const setV = (i, p, sign) => { posArr[i * 3] = p.x + sign * n.x; posArr[i * 3 + 1] = p.y + sign * n.y; posArr[i * 3 + 2] = p.z + sign * n.z; };
+  function update(enabled, joints, flag) {
+    group.visible = enabled;
+    if (!enabled) return;
+    const ok = i => joints[i][flag];
+    for (const s of spheres) { s.m.visible = ok(s.ji); if (s.m.visible) s.m.position.copy(joints[s.ji].position); }
+    for (const s of segs) { if (ok(s.a) && ok(s.b)) placeBone(s.m, joints[s.a].position, joints[s.b].position); else s.m.visible = false; }
+    if (!(ringIdx.every(ok) && centerIdx.every(ok))) { palm.visible = false; return; }
+    c.set(0, 0, 0); for (const i of centerIdx) c.add(joints[i].position); c.multiplyScalar(1 / centerIdx.length);
+    t1.subVectors(joints[jn('middle-finger-phalanx-proximal')].position, joints[0].position);
+    t2.subVectors(joints[jn('index-finger-phalanx-proximal')].position, joints[jn('pinky-finger-phalanx-proximal')].position);
+    n.crossVectors(t1, t2);
+    if (!(n.lengthSq() > 1e-10)) { palm.visible = false; return; }
+    n.normalize().multiplyScalar(PALM_HALF);
+    ringIdx.forEach((ji, i) => { setV(T(i), joints[ji].position, 1); setV(B(i), joints[ji].position, -1); });
+    setV(N, c, 1); setV(B(N), c, -1);
+    palmGeo.attributes.position.needsUpdate = true;
+    palmGeo.computeVertexNormals();
+    palm.visible = true;
+  }
+  return { update };
+}
+const rightHandMesh = makeHandMesh();    // 実右手 (TRACKED)
+const leftHandMesh = makeHandMesh();     // 仮想左手 (MIRRORED / GENERATED)
+
 /* ========== デバッグ表示 (DOM + VR内HUD) ========== */
 function debugLines() {
   const mm = v => (v * 1000).toFixed(0);
@@ -677,6 +755,13 @@ renderer.setAnimationLoop((time, frame) => {
   renderRightHand();
   renderRightArm();
   renderLeftArm();
+  rightHandMesh.update(CONFIG.showRightLimb && tracked.rightHandTracking, tracked.rightHandJoints, 'tracked');
+  if (!CONFIG.showRightLimb) armGroup.visible = false;   // 右肩〜右前腕も非表示 (計算はミラー生成のため継続)
+  leftHandMesh.update(mirrored.valid, mirrored.leftHandJoints, 'generated');
+  if (!CONFIG.showSkeleton) {                          // 既定では球と線の骨格は隠し、手の形だけを見せる
+    jointMeshes.forEach(m => { m.visible = false; }); bones.visible = false;
+    lJointMeshes.forEach(m => { m.visible = false; }); lBones.visible = false;
+  }
   updateDebug(dt);
   renderer.render(scene, camera);
 });
