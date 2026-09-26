@@ -940,7 +940,7 @@ function resolveInCube(q, r, h, dirAxis, dirSign) {       // q: cubeローカル
   else if (py <= pz) q.y = (q.y < 0 ? -1 : 1) * e;
   else q.z = (q.z < 0 ? -1 : 1) * e;
 }
-function applyHandCubeCollision(dt) {
+function legacyHandCubeCollision(dt) {                  // 旧版(関節ごとに押し出す方式。指が変形するため使用しない)
   grip.k += ((grab.active ? 1 : 0) - grip.k) * (1 - Math.exp(-dt / 0.08));   // つかむ/離すときになめらかに移行
   if (!env.anchored || !body.valid || !mirrored.valid) return;
   const useModel = realistic.ready;                        // 手モデル使用時は実右手の関節(反射前)を、簡易表示時は反転済みの関節を補正する
@@ -1012,6 +1012,101 @@ function alignCubeToPinchAxis() {                      // つかむ瞬間、cube
   grab.cubeQ0World.premultiply(_aq);
 }
 
+/* ==========================================================
+   GripPose: cubeをつかんでいる間、親指と「つまんでいる指」を、骨の長さを保ったまま(FABRIK)曲げ直し、
+   指先をcubeの向き合う面に当てる。指の形が崩れない。
+   - つまんでいない指は、指先がcubeの中に入っている場合だけ、指先を最も近い面の外へ出す。
+   - 表示専用: pinch判定・仮想pinch点・把持位置は実測の関節位置のまま。 ?grip=0 でこの補正を無効化。
+   ========================================================== */
+const _fbD = new THREE.Vector3();
+function fabrik(P, l, target) {                          // P[0]を固定し、P[n]をtargetへ寄せる。骨の長さ l を保つ
+  const n = P.length - 1, base = P[0].clone();
+  let total = 0;
+  for (const x of l) total += x;
+  if (base.distanceTo(target) >= total) {                // 届かないときは、まっすぐtarget方向へ伸ばす
+    _fbD.subVectors(target, base);
+    if (_fbD.lengthSq() < 1e-12) return;
+    _fbD.normalize();
+    for (let i = 1; i <= n; i++) P[i].copy(P[i - 1]).addScaledVector(_fbD, l[i - 1]);
+    return;
+  }
+  for (let it = 0; it < 10; it++) {
+    P[n].copy(target);
+    for (let i = n - 1; i >= 0; i--) {
+      _fbD.subVectors(P[i], P[i + 1]);
+      if (_fbD.lengthSq() < 1e-12) _fbD.set(0, 1, 0); else _fbD.normalize();
+      P[i].copy(P[i + 1]).addScaledVector(_fbD, l[i]);
+    }
+    P[0].copy(base);
+    for (let i = 1; i <= n; i++) {
+      _fbD.subVectors(P[i], P[i - 1]);
+      if (_fbD.lengthSq() < 1e-12) _fbD.set(0, 1, 0); else _fbD.normalize();
+      P[i].copy(P[i - 1]).addScaledVector(_fbD, l[i - 1]);
+    }
+    if (P[n].distanceToSquared(target) < 1e-8) break;
+  }
+}
+function applyGripPose(dt) {
+  grip.k += ((grab.active ? 1 : 0) - grip.k) * (1 - Math.exp(-dt / 0.08));   // つかむ/離すときになめらかに移行
+  const pinching = grab.active || grip.k > 0.01;
+  if (qs.get('grip') === '0' || !pinching || !env.anchored || !body.valid || !mirrored.valid || !virtualPinch.valid) return;
+  const useModel = realistic.ready;                      // 手モデル使用時は実右手の関節(反射前)を、簡易表示時は反転済みの関節を補正する
+  let J = null;
+  if (useModel) {
+    const en = realistic.entries.find(x => x.h.userData.handedness === 'right');
+    if (!en || !en.h.joints) return;
+    J = en.h.joints;
+  }
+  env.cube.updateWorldMatrix(true, false);
+  const h = CONFIG.cubeSize / 2, rt = 0.003, kk = grip.k;
+  // つまむ軸: 親指先 - 向き合う指先の重心 に最も近いcubeの軸 (cubeローカル)
+  _ad.subVectors(mirrored.leftHandJoints[IDX_THUMB_TIP].position, virtualPinch.oppose);
+  env.cube.getWorldQuaternion(_cqi).invert();
+  _ad.applyQuaternion(_cqi);
+  const ax = Math.abs(_ad.x), ay = Math.abs(_ad.y), az = Math.abs(_ad.z);
+  const axis = (ax >= ay && ax >= az) ? 0 : (ay >= az ? 1 : 2);
+  const sgn = _ad.getComponent(axis) < 0 ? -1 : 1;       // 親指側の面の向き
+
+  for (const ch of FINGER_CHAINS) {
+    const names = ch.thumb ? ch.names : ch.names.slice(1);   // 指は手のひらの中の中手骨を固定し、指の付け根(MP関節)から先を曲げ直す
+    const objs = names.map(n => useModel ? J[n] : mirrored.leftHandJoints[jn(n)]);
+    if (objs.some(o => !o || !(useModel ? o.visible : o.generated))) continue;
+    const role = ch.thumb ? 'thumb' : (pinch.active[ch.fi] ? 'oppose' : 'other');
+    const oldReal = objs.map(o => o.position.clone());
+    const P = oldReal.map(p => { const v = new THREE.Vector3(); if (useModel) mirrorPoint(p, v); else v.copy(p); return v; });   // cubeがある側(鏡像側)の座標
+    const n = P.length - 1;
+    const l = [];
+    for (let i = 0; i < n; i++) l.push(P[i].distanceTo(P[i + 1]));
+    if (l.some(x => !(x > 1e-6))) continue;
+
+    _lp.copy(P[n]);
+    env.cube.worldToLocal(_lp);
+    const cur = _lp.clone(), tgt = _lp.clone();
+    if (role === 'other') {
+      resolveInCube(tgt, rt, h, -1, 1);                  // 指先がcubeの中にあるときだけ、最も浅く出られる面の外へ
+    } else {
+      const s = role === 'thumb' ? sgn : -sgn;           // 親指は親指側の面、向き合う指は反対の面
+      for (let c = 0; c < 3; c++) if (c !== axis) tgt.setComponent(c, Math.max(-h, Math.min(h, tgt.getComponent(c))));   // 面の範囲内に
+      tgt.setComponent(axis, s * Math.max(s * tgt.getComponent(axis), h + rt));                                          // 面より内側なら外へ (外側なら動かさない)
+    }
+    if (tgt.distanceToSquared(cur) < 1e-12) continue;
+    tgt.lerpVectors(cur, tgt, kk);
+    env.cube.localToWorld(tgt);
+
+    fabrik(P, l, tgt);
+
+    const newReal = P.map(v => { const w = new THREE.Vector3(); if (useModel) mirrorPoint(v, w); else w.copy(v); return w; });
+    for (let i = 0; i <= n; i++) {
+      if (useModel) {                                    // 骨の向きも、新しい関節位置の方向へ回す
+        const j = Math.min(i, n - 1);
+        const a0 = oldReal[j + 1].clone().sub(oldReal[j]), a1 = newReal[j + 1].clone().sub(newReal[j]);
+        if (a0.lengthSq() > 1e-10 && a1.lengthSq() > 1e-10) { _q1.setFromUnitVectors(a0.normalize(), a1.normalize()); objs[i].quaternion.premultiply(_q1); }
+      }
+      objs[i].position.copy(newReal[i]);
+    }
+  }
+}
+
 function updateRealisticHands() {
   for (const e of realistic.entries) {                 // 右手のモデルが読み込まれたら肌色にして「使用可能」とする
     if (e.tinted || e.h.userData.handedness !== 'right') continue;
@@ -1044,7 +1139,7 @@ renderer.setAnimationLoop((time, frame) => {
   updatePinch();
   updateVirtualPinchPoint();
   updateGrab(dt);
-  applyHandCubeCollision(dt);
+  applyGripPose(dt);
   if (prevRightTracking && !tracked.rightHandTracking) logEvent('tracking_loss');
   prevRightTracking = tracked.rightHandTracking;
   renderPinchMarker();
