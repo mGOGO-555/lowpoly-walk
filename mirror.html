@@ -529,7 +529,10 @@ const IDX_THUMB_TIP = JOINT_NAMES.indexOf('thumb-tip');
 const IDX_INDEX_TIP = JOINT_NAMES.indexOf('index-finger-tip');
 const pinch = { on: false, valid: false, distance: NaN };
 const virtualPinch = { valid: false, point: new THREE.Vector3() };   // MIRRORED / GENERATED
-const grab = { active: false, offset: new THREE.Vector3(), vy: 0 };
+const grab = {
+  active: false, offset: new THREE.Vector3(), vy: 0,
+  hasFrame: false, handQ0: new THREE.Quaternion(), cubeQ0World: new THREE.Quaternion(),   // 把持開始時の手とcubeの姿勢
+};
 const eventLog = [];                                                  // 将来のログ記録用の下地
 function logEvent(type, extra = {}) {
   if (eventLog.length < 5000) eventLog.push({ t: performance.now(), type, ...extra });
@@ -557,10 +560,43 @@ function updateVirtualPinchPoint() {
     if (!finite3(virtualPinch.point)) virtualPinch.valid = false;
   }
 }
-const _cw = new THREE.Vector3(), _tw = new THREE.Vector3();
+const _cw = new THREE.Vector3(), _tw = new THREE.Vector3(), _va = new THREE.Vector3();
+const _hq = new THREE.Quaternion(), _hqInv = new THREE.Quaternion(), _dq = new THREE.Quaternion();
+const _tq = new THREE.Quaternion(), _gq = new THREE.Quaternion();
+
+// 仮想左手の姿勢: 反転済みの関節位置から手のひらの座標系を再構成する (反射をquaternion成分の符号反転で処理しない)
+const IDX_MID_KNUCKLE = JOINT_NAMES.indexOf('middle-finger-phalanx-proximal');
+const IDX_INDEX_MC = JOINT_NAMES.indexOf('index-finger-metacarpal');
+const IDX_PINKY_MC = JOINT_NAMES.indexOf('pinky-finger-metacarpal');
+const _fx = new THREE.Vector3(), _fy = new THREE.Vector3(), _fz = new THREE.Vector3(), _mat = new THREE.Matrix4();
+function computeLeftHandFrame(out) {
+  const L = mirrored.leftHandJoints;
+  if (!mirrored.valid || !L[0].generated || !L[IDX_MID_KNUCKLE].generated || !L[IDX_INDEX_MC].generated || !L[IDX_PINKY_MC].generated) return false;
+  _fz.subVectors(L[IDX_MID_KNUCKLE].position, L[0].position);        // 手首 → 中指の付け根 (手の長軸)
+  _fx.subVectors(L[IDX_INDEX_MC].position, L[IDX_PINKY_MC].position); // 小指側 → 人差し指側 (手のひらの横方向)
+  if (_fz.lengthSq() < 1e-8 || _fx.lengthSq() < 1e-8) return false;
+  _fz.normalize();
+  _fy.crossVectors(_fz, _fx);                                          // 手のひらの法線
+  if (_fy.lengthSq() < 1e-8) return false;
+  _fy.normalize();
+  _fx.crossVectors(_fy, _fz);                                          // 直交化した横軸 (右手系)
+  _mat.makeBasis(_fx, _fy, _fz);
+  out.setFromRotationMatrix(_mat);
+  return true;
+}
+function levelCube() {                                                 // release時: 最も上を向いている面を真上にそろえる (簡易処理)
+  const q = env.cube.quaternion;
+  let best = null, bestY = -2;
+  for (const ax of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) for (const s of [1, -1]) {
+    _va.set(ax[0] * s, ax[1] * s, ax[2] * s).applyQuaternion(q);
+    if (_va.y > bestY) { bestY = _va.y; best = _va.clone(); }
+  }
+  if (best) { _dq.setFromUnitVectors(best, Y_AXIS); q.premultiply(_dq); }
+}
 function releaseCube(reason) {
   if (!grab.active) return;
   grab.active = false; grab.vy = 0;
+  levelCube();
   env.cube.material.color.set(CONFIG.colorCube);
   logEvent('grab_release', { reason, cube: env.cube.position.toArray() });
 }
@@ -571,7 +607,15 @@ function updateGrab(dt) {
     if (!safe) releaseCube('tracking_loss');
     else if (!pinch.on) releaseCube('pinch_off');
     else {
-      _tw.copy(virtualPinch.point).add(grab.offset);
+      _tw.copy(grab.offset);
+      if (grab.hasFrame && computeLeftHandFrame(_hq)) {
+        _dq.copy(_hq).multiply(_hqInv.copy(grab.handQ0).invert());     // 把持開始からの手の回転量 (world)
+        _tw.applyQuaternion(_dq);                                        // 手とcubeの相対位置も一緒に回す
+        _tq.copy(_dq).multiply(grab.cubeQ0World);                        // cubeの世界姿勢
+        _gq.copy(env.group.quaternion).invert().multiply(_tq);           // group-localへ変換
+        env.cube.quaternion.slerp(_gq, 1 - Math.exp(-dt / 0.04));        // 軽い平滑化 (追跡ノイズ対策)
+      }
+      _tw.add(virtualPinch.point);
       if (finite3(_tw)) env.cube.position.copy(env.group.worldToLocal(_tw));
     }
   } else if (safe && pinch.on) {
@@ -579,6 +623,8 @@ function updateGrab(dt) {
     if (virtualPinch.point.distanceTo(_cw) < CONFIG.grabRange) {
       grab.active = true; grab.vy = 0;
       grab.offset.subVectors(_cw, virtualPinch.point);
+      grab.hasFrame = computeLeftHandFrame(grab.handQ0);
+      grab.cubeQ0World.copy(env.group.quaternion).multiply(env.cube.quaternion);
       env.cube.material.color.set(0xffb300);
       logEvent('grab_onset', { cube: env.cube.position.toArray() });
     }
